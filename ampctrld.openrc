@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+
+: ${AMPCTRLD_PIDFILE:="${RC_PREFIX%/}/run/${RC_SVCNAME}.pid"}
+: ${AMPCTRLD_USERNAME:="nobody"}
+
+description="Graphical equalizer daemon"
+command="${RC_PREFIX%/}/usr/local/sbin/ampctrld}"
+pidfile="$AMPCTRLD_PIDFILE"
+command_args="-p '$pidfile' -u '$AMPCTRLD_USERNAME'"
+
+if [ -n "$AMPCTRLD_LISTEN" ]; then
+  command_args="$command_args -l '$AMPCTRLD_LISTEN'"
+fi
+
+depend() {
+	need localmount
+	after bootmisc
+}
+
+start_pre() {
+	if [ -e "$pidfile" ]; then
+		rm "$pidfile"
+	fi
+}

@@ -1,0 +1,321 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html>
+<head>
+<title>ampcontrol</title>
+<meta name="viewport" content="width=device-width">
+<style type="text/css">
+body {
+  font-family:sans-serif;
+  font-size:250%;
+  color:white;
+  padding:0;
+  margin:0;
+  background-color:black;
+}
+#errorPane {
+  width:100%;
+  height:100%;
+  position:absolute;
+  top:0;
+  left:0;
+  opacity:0.3;
+  background-color:#ccc;
+  visibility:hidden;
+  padding:0;
+  margin:0;
+  z-index:998;
+}
+#errorText, #reconnect {
+  width:100%;
+  position:absolute;
+  top:50%;
+  left:0;
+  text-align:center;
+  vertical-align:middle;
+  opacity:1;
+  background-color:red;
+  visibility:hidden;
+  color:white;
+  font-weight:bold;
+  font-size:large;
+  padding:0.1em 0em 0.1em 0em;
+  margin:0;
+  z-index:999;
+}
+input, select, option {
+  font-family:sans-serif;
+  font-size:100%;
+  -webkit-appearance:button;
+  -moz-appearance:button;
+  text-align-last:center;
+}
+#ampcontrol {
+  width:300px;
+  height:800px;
+  margin:0 auto 0 auto;
+}
+.row, #mute, #power, #inputs, #volume, #led, #about, #volselect {
+  width:100%;
+  text-align:center;
+  white-space:nowrap;
+}
+#volume, a {
+  color:darkcyan;
+}
+#volume {
+  font-size:150%;
+}
+.netbtn, #volminus, #volplus {
+  width:50%;
+}
+#about {
+  margin-top:10%;
+  font-size:50%;
+}
+#volselect {
+  visibility:hidden;
+  display:none;
+}
+</style>
+</head>
+<body>
+<div id="ampcontrol">
+<div id="led">&bull;</div>
+<div class="row">
+<input id="power" type="button" value="Power" onClick="toggle('power');">
+</div>
+<div class="row">
+<input id="mute" type="button" value="Mute" onClick="toggle('mute');">
+</div>
+<div id="volume" onClick="toggleVolumeSelect();"></div>
+<div class="row">
+<input id="volminus" type="button" value="&darr;" onClick="setVolume(-1);" title="-1dB"><input id="volplus" type="button" value="&uarr;" onClick="setVolume(1);" title="+1dB"><select id="volselect" onChange="toggleVolumeSelect();" onBlur="toggleVolumeSelect();"></select>
+</div>
+<div class="row">
+<select id="inputs" onChange="setInput();"></select>
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="&#9654;" onClick="netusb('play');"><input class="netbtn" type="button" value="&#9209;" onClick="netusb('stop');">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="&#10003;" onClick="netusb('select');" title="Select"><input class="netbtn" type="button" value="&uArr;" onClick="netusb('return');" title="Return">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="&darr;" onClick="netusb('up');" title="Station -1"><input class="netbtn" type="button" value="&uarr;" onClick="netusb('down');" title="Station +1">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="&larr;" onClick="netusb('right');" title="Station -10"><input class="netbtn" type="button" value="&rarr;" onClick="netusb('left');" title="Station +10">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="1" onClick="netusb('1');"><input class="netbtn" type="button" value="2" onClick="netusb('2');">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="3" onClick="netusb('3');"><input class="netbtn" type="button" value="4" onClick="netusb('4');">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="5" onClick="netusb('5');"><input class="netbtn" type="button" value="6" onClick="netusb('6');">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="7" onClick="netusb('7');"><input class="netbtn" type="button" value="8" onClick="netusb('8');">
+</div>
+<div class="row">
+<input class="netbtn" type="button" value="9" onClick="netusb('9');"><input class="netbtn" type="button" value="0" onClick="netusb('0');">
+</div>
+<div id="about">
+<a href="https://ogris.de/ampcontrol/" target="_blank">ampcontrol</a>
+</div>
+</div>
+
+<div id="errorPane"></div>
+<div id="errorText">Connection lost!</div>
+<div id="reconnect">Amplifier down! <input type="button" value="Reconnect" onClick="reconnect();"></div>
+
+<script type="text/javascript">
+<!--
+var data = {};
+var newVolume;
+
+function toggleVolumeSelect () {
+  var volselect = document.getElementById("volselect");
+  var is_visible = (volselect.style.visibility == "visible");
+  var current_volume = ("volume" in data ? data["volume"] : -50);
+
+  if (is_visible) {
+    var selected_volume = volselect.value;
+    if (selected_volume != current_volume) {
+      setAny("volume", selected_volume.toString());
+    }
+    volselect.blur();
+  } else {
+    volselect.innerText = null;
+    var i = current_volume;
+    while (i < -25) i += 5;
+    while (i >= current_volume) {
+      volselect.add(new Option(i + "dB", i));
+      i -= 5;
+    }
+    volselect.selectedIndex = volselect.length - 1;
+    while (i > -82) {
+      volselect.add(new Option(i + "dB", i));
+      i -= 5;
+    }
+  }
+
+  document.getElementById("volminus").style.visibility = (is_visible ? "visible" : "hidden");
+  document.getElementById("volminus").style.display = (is_visible ? "" : "none");
+  document.getElementById("volplus").style.visibility = (is_visible ? "visible" : "hidden");
+  document.getElementById("volplus").style.display = (is_visible ? "" : "none");
+  volselect.style.visibility = (is_visible ? "hidden" : "visible");
+  volselect.style.display = (is_visible ? "none" : "inline");
+
+  if (!is_visible) {
+    volselect.focus();
+  }
+}
+
+function reconnect () {
+  var xmlHttp = new XMLHttpRequest();
+  xmlHttp.open("GET", "/reconnect");
+  xmlHttp.timeout = 10000;
+  xmlHttp.send();
+}
+
+function setAny (what, level) {
+  var xmlHttp = new XMLHttpRequest();
+  xmlHttp.open("GET", "/set?" + what + "=" + level);
+  xmlHttp.timeout = 10000;
+  xmlHttp.send();
+}
+
+function toggle (what) {
+  setAny(what, !data[what]);
+}
+
+function netusb (what) {
+  setAny("ntc", what);
+}
+
+function setVolume (incr) {
+  newVolume = newVolume + incr;
+  setAny("volume", newVolume.toString());
+}
+
+function setInput () {
+  setAny("input", document.getElementById("inputs").value);
+}
+
+function getInputs () {
+  var xmlHttp = new XMLHttpRequest();
+  xmlHttp.onreadystatechange = function () {
+    if ((xmlHttp.readyState == 4) && (xmlHttp.status == 200)) {
+      try {
+        var inputs = JSON.parse(xmlHttp.response);
+        Object.keys(inputs).forEach(function (input) {
+          if (document.getElementById("inputs")) {
+            document.getElementById("inputs").add(new Option(inputs[input], input));
+          }
+        });
+      } catch (e) {
+      }
+    }
+  };
+  xmlHttp.open("GET", "/getinputs");
+  xmlHttp.timeout = 10000;
+  xmlHttp.send();
+}
+
+function processStatus (response) {
+  try {
+    data = JSON.parse(response);
+    var reconnect, led, power, state, opacity;
+
+    if (!data["connected"]) {
+      reconnect = "visible";
+      led = "white";
+      power = "disabled";
+      state = "disabled";
+      opacity = "0.0";
+    } else if (!data["power"]) {
+      reconnect = "hidden";
+      led = "red";
+      power = "";
+      state = "disabled";
+      opacity = "0.0";
+    } else if (data["mute"]) {
+      reconnect = "hidden";
+      led = "white";
+      power = "";
+      state = "";
+      opacity = "0.5";
+    } else {
+      reconnect = "hidden";
+      led = "white";
+      power = "";
+      state = "";
+      opacity = "1.0";
+    }
+    
+    document.getElementById("reconnect").style.visibility = reconnect;
+    document.getElementById("led").style.color = led;
+    document.getElementById("power").disabled = power;
+    document.getElementById("mute").disabled = state;
+    document.getElementById("volminus").disabled = state;
+    document.getElementById("volume").style.opacity = opacity;
+    document.getElementById("volplus").disabled = state;
+    document.getElementById("inputs").disabled = state;
+
+    document.getElementById("volume").innerHTML = data["volume"] + "dB";
+    document.getElementById("inputs").value = data["input"];
+
+    newVolume = parseInt(data["volume"]);
+
+    var netbtnState;
+    if ((state != "disabled") && (data["input"] == "28")) {
+      netbtnState = "";
+    } else {
+      netbtnState = "disabled";
+    }
+
+    var netbtns = document.getElementsByClassName("netbtn");
+    for (var i = 0; i < netbtns.length; i++) {
+      netbtns[i].disabled = netbtnState;
+    }
+  } catch (e) {
+    toggleErrorPane("visible");
+  }
+}
+
+function toggleErrorPane (visibility) {
+  var errorPane = document.getElementById("errorPane");
+
+  if (errorPane.style.visibility != visibility) {
+    errorPane.style.visibility = visibility;
+    document.getElementById("errorText").style.visibility = visibility;
+  }
+}
+
+function startRequest () {
+  var xmlHttp = new XMLHttpRequest();
+  xmlHttp.onreadystatechange = function () {
+    if (xmlHttp.readyState == 4) {
+      if (xmlHttp.status == 200) {
+        toggleErrorPane("hidden");
+        processStatus(xmlHttp.response);
+      } else {
+        toggleErrorPane("visible");
+      }
+      window.setTimeout(startRequest, 1000);
+    }
+  };
+  xmlHttp.open("GET", "/getstatus");
+  xmlHttp.timeout = 10000;
+  xmlHttp.send();
+}
+
+getInputs();
+startRequest();
+
+-->
+</script>
+</body>
+</html>

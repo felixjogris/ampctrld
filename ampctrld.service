@@ -1,0 +1,12 @@
+[Unit]
+Description=Graphical equalizer daemon
+Documentation=https://ogris.de/ampcontrol/
+Requires=local-fs.target
+Conflicts=shutdown.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+ExecStart=/usr/local/sbin/ampctrld -d -u nobody
+Restart=always
