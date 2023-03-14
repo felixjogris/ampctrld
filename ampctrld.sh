@@ -27,6 +27,9 @@ command_args="-p '$pidfile' -u '$ampctrld_username'"
 if [ -n "$ampctrld_listen" ]; then
   command_args="$command_args -l '$ampctrld_listen'"
 fi
+if [ -n "$ampctrld_args" ]; then
+  command_args="$command_args $ampctrld_args"
+fi
 
 remove_stale_pidfile() {
   if [ -e "$pidfile" -a -z "$(check_pidfile "$pidfile" "$command")" ]; then

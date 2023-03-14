@@ -11,6 +11,9 @@ command_args="-p '$pidfile' -u '$AMPCTRLD_USERNAME'"
 if [ -n "$AMPCTRLD_LISTEN" ]; then
   command_args="$command_args -l '$AMPCTRLD_LISTEN'"
 fi
+if [ -n "$AMPCTRLD_ARGS" ]; then
+  command_args="$command_args $AMPCTRLD_ARGS"
+fi
 
 depend() {
 	need localmount

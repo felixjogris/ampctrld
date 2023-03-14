@@ -27,6 +27,10 @@
 
 #define AMPCTRLD_VERSION "1"
 
+#define DEFAULT_ADDRESS "0.0.0.0"
+#define DEFAULT_PORT    "8082"
+#define QUEUE_LEN       8
+
 #define log_error(fmt, params ...) do { \
   if (log_to_syslog) \
     syslog(LOG_ERR, "%s (%s:%i): " fmt "\n", \
@@ -58,14 +62,12 @@
 struct connection {
   enum {
     FREE,
-    ACCEPT,
+    LISTEN,
     AMP,
     CLIENT
   } type;
   int socket;
   char clientname[INET6_ADDRSTRLEN + 8];
-  struct sockaddr addr;
-  socklen_t addr_len;
 };
 
 /* used by main() and quitterm_handler() */
@@ -253,31 +255,61 @@ static void change_user (struct passwd *pw)
     err(1, "setuid()");
 }
 
-static void client_address (struct connection *arg)
+static void client_address (struct sockaddr *saddr, struct connection *conn)
 {
   char addr[INET6_ADDRSTRLEN];
   struct sockaddr_in *sin;
   struct sockaddr_in6 *sin6;
 
-  switch (arg->addr.sa_family) {
+  switch (saddr->sa_family) {
     case AF_INET:
-      sin = (struct sockaddr_in*) &arg->addr;
-      snprintf(arg->clientname, sizeof(arg->clientname), "%s:%u",
+      sin = (struct sockaddr_in*) saddr;
+      snprintf(conn->clientname, sizeof(conn->clientname), "%s:%u",
                inet_ntop(sin->sin_family, &sin->sin_addr, addr, sizeof(addr)),
                htons(sin->sin_port));
       break;
     case AF_INET6:
-      sin6 = (struct sockaddr_in6*) &arg->addr;
-      snprintf(arg->clientname, sizeof(arg->clientname), "[%s]:%u",
+      sin6 = (struct sockaddr_in6*) saddr;
+      snprintf(conn->clientname, sizeof(conn->clientname), "[%s]:%u",
                inet_ntop(sin6->sin6_family, &sin6->sin6_addr, addr,
                          sizeof(addr)),
                htons(sin6->sin6_port));
       break;
     default:
-      snprintf(arg->clientname, sizeof(arg->clientname),
-               "<unknown address family %u>", arg->addr.sa_family);
+      snprintf(conn->clientname, sizeof(conn->clientname),
+               "<unknown address family %u>", saddr->sa_family);
       break;
   }
+}
+
+static char *parse_address (char *ip46_port, char **addr, char **port,
+                            char *default_port)
+{
+  char *closing_bracket;
+
+  if (*ip46_port == '[') {
+    *addr = ip46_port + 1;
+    closing_bracket = strchr(ip46_port, ']');
+    if (!closing_bracket)
+      return "missing ']' in address";
+
+    if (*(closing_bracket + 1) && (*(closing_bracket + 1) != ':'))
+      return "expected ':' after ']'";
+
+    *closing_bracket++ = '\0';
+  } else {
+    *addr = ip46_port;
+    closing_bracket = strchr(ip46_port, ':');
+  }
+
+  if (!closing_bracket || !*closing_bracket)
+    *port  = default_port;
+  else {
+    *port = closing_bracket + 1;
+    *closing_bracket = '\0';
+  }
+
+  return NULL;
 }
 
 static char *str2buf (char *buf, const char * const str, size_t l)
@@ -300,12 +332,12 @@ static void int2str (char *buf, int i, int len)
     *p-- = ' ';
 }
 
-static void log_http (struct connection *arg, const char *url, int code)
+static void log_http (struct connection *conn, const char *url, int code)
 {
-  log_info("%s \"%s\" %i", arg->clientname, url, code);
+  log_info("%s \"%s\" %i", conn->clientname, url, code);
 }
 
-static int send_http (struct connection *arg, const char *url,
+static int send_http (struct connection *conn, const char *url,
                       int code, int connection_close,
                       char *header_and_content, size_t header_content_size)
 {
@@ -318,7 +350,7 @@ static int send_http (struct connection *arg, const char *url,
   struct iovec iov[5];
   ssize_t len;
 
-  log_http(arg, url, code);
+  log_http(conn, url, code);
 
   p = str2buf(buf, status_line, sizeof(status_line));
   int2str(p - 2, code, 3);
@@ -360,19 +392,20 @@ static int send_http (struct connection *arg, const char *url,
   iov[idx++].iov_len = header_content_size;
   len += header_content_size;
 
-  res = writev(arg->socket, iov, idx);
+  res = writev(conn->socket, iov, idx);
   if ((res < 0) || (res != len))
     return -1;
 
   if (connection_close) {
-    close(arg->socket);
+    close(conn->socket);
+    conn->type = FREE;
     return 1;
   }
 
   return 0;
 }
 
-static int read_http (struct connection *arg)
+static int read_http (struct connection *conn)
 {
   char buf[8192], *p;
   unsigned int idx = 0;
@@ -389,7 +422,7 @@ static int read_http (struct connection *arg)
                        "Bad Request.\r\n";
 
   while (idx < sizeof(buf) - 1) {
-    res = read(arg->socket, &buf[idx], sizeof(buf) - idx - 1);
+    res = read(conn->socket, &buf[idx], sizeof(buf) - idx - 1);
     if (res <= 0)
       return -1;
 
@@ -402,11 +435,11 @@ static int read_http (struct connection *arg)
     connection_close = (strcasestr(buf, "\r\nConnection: close\r\n") != NULL);
 
     if (!strncasecmp(buf, "GET / ", strlen("GET / ")))
-      return send_http(arg, "/", 200, connection_close, rootpage,
+      return send_http(conn, "/", 200, connection_close, rootpage,
                        sizeof(rootpage));
 
     if (!strncasecmp(buf, "GET /favicon.ico ", strlen("GET /favicon.ico ")))
-      return send_http(arg, "/favicon.ico", 200, connection_close, favicon,
+      return send_http(conn, "/favicon.ico", 200, connection_close, favicon,
                        sizeof(favicon));
 
     /* TODO */
@@ -414,12 +447,77 @@ static int read_http (struct connection *arg)
     p = strchr(buf, '\r');
     *p = '\0';
 
-    return send_http(arg, buf, 404, connection_close, not_found,
+    return send_http(conn, buf, 404, connection_close, not_found,
                      sizeof(not_found) - 1);
   }
 
-  return send_http(arg, "", 400, connection_close, bad_request,
+  return send_http(conn, "", 400, connection_close, bad_request,
                    sizeof(bad_request) - 1);
+}
+
+static int handle_client (struct connection *conns, int *num_conns, int fd)
+{
+  int newfd;
+  struct sockaddr addr;
+  socklen_t addr_len;
+
+  if (conns[fd].type == LISTEN) {
+    do {
+      addr_len = sizeof(addr);
+      newfd = accept(fd, &addr, &addr_len);
+    } while ((newfd < 0) && (errno == EINTR));
+
+    if (newfd < 0) {
+      log_warn("accept(): %s", strerror(errno));
+      return newfd;
+    }
+
+    if (newfd >= FD_SETSIZE) {
+      log_warn("too many connection, maximum is %i", FD_SETSIZE);
+      close(newfd);
+      return 0;
+    }
+
+    conns[newfd].type = CLIENT;
+    conns[newfd].socket = newfd;
+    client_address(&addr, &conns[newfd]);
+    if (newfd >= *num_conns)
+      *num_conns = newfd + 1;
+  }
+//  if (conns[i]->type == AMP)
+  if (conns[fd].type == CLIENT)
+    return read_http(&conns[fd]);
+
+  return 0;
+}
+
+static int wait_for_client (struct connection *conns, int *num_conns)
+{
+  int i, ready, res;
+  fd_set rfds;
+
+  FD_ZERO(&rfds);
+  for (i = 0; i < *num_conns; i++)
+    if (conns[i].type != FREE)
+      FD_SET(i, &rfds);
+
+  if ((ready = select(*num_conns, &rfds, NULL, NULL, NULL)) < 0) {
+    if (errno == EINTR)
+      return 0;
+
+    log_error("select(): %s", strerror(errno));
+    return ready;
+  }
+
+  for (i = 0; ready && (i < *num_conns); i++) {
+    if (FD_ISSET(i, &rfds)) {
+      ready--;
+      if ((res = handle_client(conns, num_conns, i)))
+        return res;
+    }
+  }
+
+  return 0;
 }
 
 static void show_help ()
@@ -428,42 +526,71 @@ static void show_help ()
 "ampctrld version " AMPCTRLD_VERSION "\n"
 "\n"
 "Usage:\n"
-"ampctrld [-a <address>] [-d] [-l <port>] [-p <pid file>] [-u <user>]\n"
+"ampctrld [-d] [-l <address[:port]>] [-p <pid file>] [-u <user>]\n"
 "ampctrld -h\n"
 "\n"
-"  -a <address>     listen on this address; default: 0.0.0.0\n"
-"  -d               run in foreground, and log to stdout/stderr, do not "
-                                                                    "detach\n"
-"                   from terminal, do not log to syslog\n"
-"  -l <port>        listen on this port; default: 8082\n"
-"  -p <pid file>    daemonize and save pid to this file; no default, pid "
-                                                                      "gets\n"
-"                   not written to any file unless <pid file> is given\n"
-"  -u <user>        switch to this user; no default, run as invoking user\n"
-"  -h               show this help ;-)\n"
+"  -d                     run in foreground, and log to stdout/stderr, do "
+                                                                       "not\n"
+"                         detach from terminal, do not log to syslog\n"
+"  -l <address[:port]>    listen on this address and port; a maximum of "
+                                                STR(FD_SETSIZE) "\n"
+"                         addresses may be specified; port defaults to "
+                                                            DEFAULT_PORT ";\n"
+"                         default: " DEFAULT_ADDRESS ":" DEFAULT_PORT "\n"
+"  -p <pidfile>           daemonize and save pid to this file; no default, "
+                                                                       "pid\n"
+"                         gets not written to any file unless <pidfile> is "
+                                                                     "given\n"
+"  -u <user>              switch to this user; no default, run as invoking "
+                                                                      "user\n"
+"  -h                     show this help ;-)\n"
 );
 }
 
 int main (int argc, char **argv)
 {
-  int res, listen_socket, foreground = 0;
-  char *address = "0.0.0.0", *port = "8083", *pidfile = NULL;
+  int res, num_conns = 0, foreground = 0;
+  char *address, *port, *pidfile = NULL;
   const char *err;
   struct passwd *user = NULL;
+  struct connection conns[FD_SETSIZE];
 
-  while ((res = getopt(argc, argv, "a:dhl:p:u:")) != -1) {
+  for (res = 0; res < FD_SETSIZE; res++)
+    conns[res].type = FREE;
+
+  while ((res = getopt(argc, argv, "dhl:p:u:")) != -1) {
     switch (res) {
-      case 'a': address = optarg; break;
       case 'd': foreground = 1; break;
       case 'h': show_help(); return 0;
-      case 'l': port = optarg; break;
+      case 'l':
+        err = parse_address(optarg, &address, &port, DEFAULT_PORT);
+        if (err)
+          errx(1, "%s: %s", optarg, err);
+
+        res = create_listen_socket_inet(address, port);
+        if (res >= FD_SETSIZE)
+          errx(1, "too many addresses to listen on given, maximum is %i",
+                  FD_SETSIZE);
+
+        conns[res].type = LISTEN;
+        if (res >= num_conns)
+          num_conns = res + 1;
+        break;
       case 'p': pidfile = optarg; break;
       case 'u': user = get_user(optarg); break;
       default: errx(1, "Unknown option '%c'. See -h for help.", optopt);
     }
   }
 
-  listen_socket = create_listen_socket_inet(address, port);
+  if (!num_conns) {
+    res = create_listen_socket_inet(DEFAULT_ADDRESS, DEFAULT_PORT);
+    if (res >= FD_SETSIZE)
+      errx(1, "too many addresses to listen on given, maximum is %i",
+              FD_SETSIZE);
+
+    conns[res].type = LISTEN;
+    num_conns = res + 1;
+  }
 
   if (!foreground)
     daemonize();
@@ -489,12 +616,14 @@ int main (int argc, char **argv)
 #endif
 
   while (running) {
-    res = wait_for_client(listen_socket);
+    res = wait_for_client(conns, &num_conns);
     if (res < 0)
       running = 0;
   }
 
-  close(listen_socket);
+  while (num_conns)
+    if (conns[--num_conns].type != FREE)
+      close(num_conns);
 
   if (pidfile)
     unlink(pidfile); /* may fail, e.g. due to changed user privs */
