@@ -337,6 +337,34 @@ void queue_init (struct queue *queue)
   queue->start = queue->end = 0;
 }
 
+int queue_emtpy (struct queue *queue)
+{
+  return (queue->start == queue->end);
+}
+
+int queue_push (struct queue *queue)
+{
+  int ret = queue->end;
+
+  if (++queue->end >= QUEUE_LEN)
+    queue->end = 0;
+
+  if (queue->end == queue->start)
+    log_warn("%s", "queue overflow");
+
+  return ret;
+}
+
+int queue_shift (struct queue *queue)
+{
+  int ret = (queue_empty(queue) ? -1 : queue->start);
+
+  if (++queue->start >= QUEUE_LEN)
+    queue->start = 0;
+
+  return ret;
+}
+
 void sockets_init (struct sockets *sockets)
 {
   int i;
@@ -542,7 +570,7 @@ static int handle_client (struct sockets *sockets, struct queue *queue, int fd)
 
     client_address(sockets, newfd, addr);
   }
-//  if (sockets->conns[ifd]->type == AMP)
+//  if (sockets->conns[fd].type == AMP)
   if (sockets->conns[fd].type == CLIENT)
     return read_http(sockets, queue, fd);
 
