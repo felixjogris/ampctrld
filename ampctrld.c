@@ -70,6 +70,12 @@ struct connection {
   char clientname[INET6_ADDRSTRLEN + 8];
 };
 
+union address {
+  struct sockaddr saddr;
+  struct sockaddr_in sin;
+  struct sockaddr_in6 sin6;
+};
+
 /* used by main() and quitterm_handler() */
 static int running = 1;
 /* used by main() and log_*() macros */
@@ -255,21 +261,21 @@ static void change_user (struct passwd *pw)
     err(1, "setuid()");
 }
 
-static void client_address (struct sockaddr *saddr, struct connection *conn)
+static void client_address (union address *uaddr, struct connection *conn)
 {
   char addr[INET6_ADDRSTRLEN];
   struct sockaddr_in *sin;
   struct sockaddr_in6 *sin6;
 
-  switch (saddr->sa_family) {
+  switch (uaddr->sin.sin_family) {
     case AF_INET:
-      sin = (struct sockaddr_in*) saddr;
+      sin = &uaddr->sin;
       snprintf(conn->clientname, sizeof(conn->clientname), "%s:%u",
                inet_ntop(sin->sin_family, &sin->sin_addr, addr, sizeof(addr)),
                htons(sin->sin_port));
       break;
     case AF_INET6:
-      sin6 = (struct sockaddr_in6*) saddr;
+      sin6 = &uaddr->sin6;
       snprintf(conn->clientname, sizeof(conn->clientname), "[%s]:%u",
                inet_ntop(sin6->sin6_family, &sin6->sin6_addr, addr,
                          sizeof(addr)),
@@ -277,7 +283,7 @@ static void client_address (struct sockaddr *saddr, struct connection *conn)
       break;
     default:
       snprintf(conn->clientname, sizeof(conn->clientname),
-               "<unknown address family %u>", saddr->sa_family);
+               "<unknown address family %u>", uaddr->sin.sin_family);
       break;
   }
 }
@@ -458,13 +464,13 @@ static int read_http (struct connection *conn)
 static int handle_client (struct connection *conns, int *num_conns, int fd)
 {
   int newfd;
-  struct sockaddr addr;
+  union address addr;
   socklen_t addr_len;
 
   if (conns[fd].type == LISTEN) {
     do {
       addr_len = sizeof(addr);
-      newfd = accept(fd, &addr, &addr_len);
+      newfd = accept(fd, &addr.saddr, &addr_len);
     } while ((newfd < 0) && (errno == EINTR));
 
     if (newfd < 0) {
