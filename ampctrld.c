@@ -337,7 +337,7 @@ void queue_init (struct queue *queue)
   queue->start = queue->end = 0;
 }
 
-int queue_emtpy (struct queue *queue)
+int queue_empty (struct queue *queue)
 {
   return (queue->start == queue->end);
 }
