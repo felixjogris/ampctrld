@@ -27,9 +27,10 @@
 
 #define AMPCTRLD_VERSION "1"
 
-#define DEFAULT_ADDRESS "0.0.0.0"
-#define DEFAULT_PORT    "8082"
-#define QUEUE_LEN       8
+#define DEFAULT_ADDRESS  "0.0.0.0"
+#define DEFAULT_PORT     "8082"
+#define MAX_CONNS        FD_SETSIZE
+#define QUEUE_LEN        8
 
 #define log_error(fmt, params ...) do { \
   if (log_to_syslog) \
@@ -58,22 +59,31 @@
 #define XSTR(a) #a
 #define STR(a) XSTR(a)
 
-/* defines a socket */
-struct connection {
-  enum {
-    FREE,
-    LISTEN,
-    AMP,
-    CLIENT
-  } type;
-  int socket;
-  char clientname[INET6_ADDRSTRLEN + 8];
-};
-
+/* for accept() */
 union address {
   struct sockaddr saddr;
   struct sockaddr_in sin;
   struct sockaddr_in6 sin6;
+};
+
+/* defines a socket */
+enum conntype {
+  FREE,
+  LISTEN,
+  AMP,
+  CLIENT
+};
+struct sockets {
+  int num_conns;
+  struct {
+    enum conntype type;
+    char clientname[INET6_ADDRSTRLEN + 8];
+  } conns[MAX_CONNS];
+};
+
+struct queue {
+  int start, end;
+  char entries[QUEUE_LEN][10];
 };
 
 /* used by main() and quitterm_handler() */
@@ -261,29 +271,33 @@ static void change_user (struct passwd *pw)
     err(1, "setuid()");
 }
 
-static void client_address (union address *uaddr, struct connection *conn)
+static void client_address (struct sockets *sockets, int fd,
+                            union address uaddr)
 {
   char addr[INET6_ADDRSTRLEN];
   struct sockaddr_in *sin;
   struct sockaddr_in6 *sin6;
 
-  switch (uaddr->sin.sin_family) {
+  switch (uaddr.sin.sin_family) {
     case AF_INET:
-      sin = &uaddr->sin;
-      snprintf(conn->clientname, sizeof(conn->clientname), "%s:%u",
+      sin = &uaddr.sin;
+      snprintf(sockets->conns[fd].clientname,
+               sizeof(sockets->conns[fd].clientname), "%s:%u",
                inet_ntop(sin->sin_family, &sin->sin_addr, addr, sizeof(addr)),
                htons(sin->sin_port));
       break;
     case AF_INET6:
-      sin6 = &uaddr->sin6;
-      snprintf(conn->clientname, sizeof(conn->clientname), "[%s]:%u",
+      sin6 = &uaddr.sin6;
+      snprintf(sockets->conns[fd].clientname,
+               sizeof(sockets->conns[fd].clientname), "[%s]:%u",
                inet_ntop(sin6->sin6_family, &sin6->sin6_addr, addr,
                          sizeof(addr)),
                htons(sin6->sin6_port));
       break;
     default:
-      snprintf(conn->clientname, sizeof(conn->clientname),
-               "<unknown address family %u>", uaddr->sin.sin_family);
+      snprintf(sockets->conns[fd].clientname,
+               sizeof(sockets->conns[fd].clientname),
+               "<unknown address family %u>", uaddr.sin.sin_family);
       break;
   }
 }
@@ -318,6 +332,51 @@ static char *parse_address (char *ip46_port, char **addr, char **port,
   return NULL;
 }
 
+void queue_init (struct queue *queue)
+{
+  queue->start = queue->end = 0;
+}
+
+void sockets_init (struct sockets *sockets)
+{
+  int i;
+
+  sockets->num_conns = 0;
+  for (i = 0; i < MAX_CONNS; i++)
+    sockets->conns[i].type = FREE;
+}
+
+char *sockets_add (struct sockets *sockets, int fd, enum conntype type)
+{
+  if (fd >= MAX_CONNS)
+    return "socket descriptor too big, maximum is " STR(MAX_CONNS);
+
+  sockets->conns[fd].type = type;
+  if (fd >= sockets->num_conns)
+    sockets->num_conns = fd + 1;
+
+  return NULL;
+}
+
+void sockets_close (struct sockets *sockets, int fd)
+{
+  if (fd >= MAX_CONNS)
+    return;
+
+  if (sockets->conns[fd].type == FREE)
+    return;
+
+  close(fd);
+  sockets->conns[fd].type = FREE;
+
+  while ((fd >= 0) &&
+         (fd + 1 == sockets->num_conns) &&
+         (sockets->conns[fd].type == FREE)) {
+    fd--;
+    sockets->num_conns--;
+  }
+}
+
 static char *str2buf (char *buf, const char * const str, size_t l)
 {          
   memcpy(buf, str, l - 1);
@@ -338,12 +397,7 @@ static void int2str (char *buf, int i, int len)
     *p-- = ' ';
 }
 
-static void log_http (struct connection *conn, const char *url, int code)
-{
-  log_info("%s \"%s\" %i", conn->clientname, url, code);
-}
-
-static int send_http (struct connection *conn, const char *url,
+static int send_http (struct sockets *sockets, int fd, const char *url,
                       int code, int connection_close,
                       char *header_and_content, size_t header_content_size)
 {
@@ -356,7 +410,7 @@ static int send_http (struct connection *conn, const char *url,
   struct iovec iov[5];
   ssize_t len;
 
-  log_http(conn, url, code);
+  log_info("%s \"%s\" %i", sockets->conns[fd].clientname, url, code);
 
   p = str2buf(buf, status_line, sizeof(status_line));
   int2str(p - 2, code, 3);
@@ -378,6 +432,7 @@ static int send_http (struct connection *conn, const char *url,
       iov[1].iov_base = "Internal Server Error";
       break;
   }
+
   iov[1].iov_len = strlen(iov[1].iov_base);
   len += strlen(iov[1].iov_base);
 
@@ -398,20 +453,17 @@ static int send_http (struct connection *conn, const char *url,
   iov[idx++].iov_len = header_content_size;
   len += header_content_size;
 
-  res = writev(conn->socket, iov, idx);
+  res = writev(fd, iov, idx);
   if ((res < 0) || (res != len))
     return -1;
 
-  if (connection_close) {
-    close(conn->socket);
-    conn->type = FREE;
-    return 1;
-  }
+  if (connection_close)
+    sockets_close(sockets, fd);
 
   return 0;
 }
 
-static int read_http (struct connection *conn)
+static int read_http (struct sockets *sockets, struct queue *queue, int fd)
 {
   char buf[8192], *p;
   unsigned int idx = 0;
@@ -428,9 +480,11 @@ static int read_http (struct connection *conn)
                        "Bad Request.\r\n";
 
   while (idx < sizeof(buf) - 1) {
-    res = read(conn->socket, &buf[idx], sizeof(buf) - idx - 1);
-    if (res <= 0)
-      return -1;
+    res = read(fd, &buf[idx], sizeof(buf) - idx - 1);
+    if (res <= 0) {
+      sockets_close(sockets, fd);
+      return res;
+    }
 
     idx += res;
     buf[idx] = '\0';
@@ -441,33 +495,34 @@ static int read_http (struct connection *conn)
     connection_close = (strcasestr(buf, "\r\nConnection: close\r\n") != NULL);
 
     if (!strncasecmp(buf, "GET / ", strlen("GET / ")))
-      return send_http(conn, "/", 200, connection_close, rootpage,
+      return send_http(sockets, fd, "/", 200, connection_close, rootpage,
                        sizeof(rootpage));
 
     if (!strncasecmp(buf, "GET /favicon.ico ", strlen("GET /favicon.ico ")))
-      return send_http(conn, "/favicon.ico", 200, connection_close, favicon,
-                       sizeof(favicon));
+      return send_http(sockets, fd, "/favicon.ico", 200, connection_close,
+                       favicon, sizeof(favicon));
 
     /* TODO */
 
     p = strchr(buf, '\r');
     *p = '\0';
 
-    return send_http(conn, buf, 404, connection_close, not_found,
+    return send_http(sockets, fd, buf, 404, connection_close, not_found,
                      sizeof(not_found) - 1);
   }
 
-  return send_http(conn, "", 400, connection_close, bad_request,
+  return send_http(sockets, fd, "", 400, connection_close, bad_request,
                    sizeof(bad_request) - 1);
 }
 
-static int handle_client (struct connection *conns, int *num_conns, int fd)
+static int handle_client (struct sockets *sockets, struct queue *queue, int fd)
 {
   int newfd;
   union address addr;
   socklen_t addr_len;
+  char *err;
 
-  if (conns[fd].type == LISTEN) {
+  if (sockets->conns[fd].type == LISTEN) {
     do {
       addr_len = sizeof(addr);
       newfd = accept(fd, &addr.saddr, &addr_len);
@@ -478,36 +533,39 @@ static int handle_client (struct connection *conns, int *num_conns, int fd)
       return newfd;
     }
 
-    if (newfd >= FD_SETSIZE) {
-      log_warn("too many connection, maximum is %i", FD_SETSIZE);
+    err = sockets_add(sockets, newfd, CLIENT);
+    if (err) {
+      log_warn("%s", err);
       close(newfd);
       return 0;
     }
 
-    conns[newfd].type = CLIENT;
-    conns[newfd].socket = newfd;
-    client_address(&addr, &conns[newfd]);
-    if (newfd >= *num_conns)
-      *num_conns = newfd + 1;
+    client_address(sockets, newfd, addr);
   }
-//  if (conns[i]->type == AMP)
-  if (conns[fd].type == CLIENT)
-    return read_http(&conns[fd]);
+//  if (sockets->conns[ifd]->type == AMP)
+  if (sockets->conns[fd].type == CLIENT)
+    return read_http(sockets, queue, fd);
 
   return 0;
 }
 
-static int wait_for_client (struct connection *conns, int *num_conns)
+static int wait_for_client (struct sockets *sockets, struct queue *queue)
 {
   int i, ready, res;
   fd_set rfds;
+  struct timeval timeout;
 
   FD_ZERO(&rfds);
-  for (i = 0; i < *num_conns; i++)
-    if (conns[i].type != FREE)
+  for (i = 0; i < sockets->num_conns; i++)
+    if (sockets->conns[i].type != FREE)
       FD_SET(i, &rfds);
 
-  if ((ready = select(*num_conns, &rfds, NULL, NULL, NULL)) < 0) {
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 500000;
+
+  ready = select(sockets->num_conns, &rfds, NULL, NULL,
+                 (queue->start != queue->end ? &timeout : NULL));
+  if (ready < 0) {
     if (errno == EINTR)
       return 0;
 
@@ -515,10 +573,10 @@ static int wait_for_client (struct connection *conns, int *num_conns)
     return ready;
   }
 
-  for (i = 0; ready && (i < *num_conns); i++) {
+  for (i = 0; ready && (i < sockets->num_conns); i++) {
     if (FD_ISSET(i, &rfds)) {
       ready--;
-      if ((res = handle_client(conns, num_conns, i)))
+      if ((res = handle_client(sockets, queue, i)))
         return res;
     }
   }
@@ -539,7 +597,7 @@ static void show_help ()
                                                                        "not\n"
 "                         detach from terminal, do not log to syslog\n"
 "  -l <address[:port]>    listen on this address and port; a maximum of "
-                                                STR(FD_SETSIZE) "\n"
+                                                STR(MAX_CONNS) "\n"
 "                         addresses may be specified; port defaults to "
                                                             DEFAULT_PORT ";\n"
 "                         default: " DEFAULT_ADDRESS ":" DEFAULT_PORT "\n"
@@ -555,14 +613,15 @@ static void show_help ()
 
 int main (int argc, char **argv)
 {
-  int res, num_conns = 0, foreground = 0;
+  int res, foreground = 0;
   char *address, *port, *pidfile = NULL;
   const char *err;
   struct passwd *user = NULL;
-  struct connection conns[FD_SETSIZE];
+  struct sockets sockets;
+  struct queue queue;
 
-  for (res = 0; res < FD_SETSIZE; res++)
-    conns[res].type = FREE;
+  sockets_init(&sockets);
+  queue_init(&queue);
 
   while ((res = getopt(argc, argv, "dhl:p:u:")) != -1) {
     switch (res) {
@@ -574,13 +633,9 @@ int main (int argc, char **argv)
           errx(1, "%s: %s", optarg, err);
 
         res = create_listen_socket_inet(address, port);
-        if (res >= FD_SETSIZE)
-          errx(1, "too many addresses to listen on given, maximum is %i",
-                  FD_SETSIZE);
+        if ((err = sockets_add(&sockets, res, LISTEN)))
+          errx(1, "%s", err);
 
-        conns[res].type = LISTEN;
-        if (res >= num_conns)
-          num_conns = res + 1;
         break;
       case 'p': pidfile = optarg; break;
       case 'u': user = get_user(optarg); break;
@@ -588,14 +643,10 @@ int main (int argc, char **argv)
     }
   }
 
-  if (!num_conns) {
+  if (!sockets.num_conns) {
     res = create_listen_socket_inet(DEFAULT_ADDRESS, DEFAULT_PORT);
-    if (res >= FD_SETSIZE)
-      errx(1, "too many addresses to listen on given, maximum is %i",
-              FD_SETSIZE);
-
-    conns[res].type = LISTEN;
-    num_conns = res + 1;
+    if ((err = sockets_add(&sockets, res, LISTEN)))
+      errx(1, "%s", err);
   }
 
   if (!foreground)
@@ -622,14 +673,13 @@ int main (int argc, char **argv)
 #endif
 
   while (running) {
-    res = wait_for_client(conns, &num_conns);
+    res = wait_for_client(&sockets, &queue);
     if (res < 0)
       running = 0;
   }
 
-  while (num_conns)
-    if (conns[--num_conns].type != FREE)
-      close(num_conns);
+  for (res = 0; res < sockets.num_conns; res++)
+    sockets_close(&sockets, res);
 
   if (pidfile)
     unlink(pidfile); /* may fail, e.g. due to changed user privs */
