@@ -7,14 +7,14 @@ LDFLAGS = -s
 ampctrld:	ampctrld.o
 	$(CC) $(LDFLAGS) -o $@ ampctrld.o
 
-ampctrld.o:	ampctrld.c rootpage.h favicon.h
+ampctrld.o:	ampctrld.c rootpage_html.h favicon_ico.h
 	$(CC) $(CFLAGS) -c -o $@ ampctrld.c
 
-rootpage.h:	rootpage.html bin2c.pl
-	perl bin2c.pl rootpage.html "text/html; charset=utf8" rootpage
+rootpage_html.h:	rootpage.html bin2c.pl
+	perl bin2c.pl rootpage.html
 
-favicon.h:	favicon.ico bin2c.pl
-	perl bin2c.pl favicon.ico "image/x-icon" favicon
+favicon_ico.h:	favicon.ico bin2c.pl
+	perl bin2c.pl favicon.ico
 
 install:	ampctrld ampctrld.sh
 	install -d /usr/local/sbin /usr/local/etc/rc.d

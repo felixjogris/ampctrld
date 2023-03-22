@@ -3,10 +3,9 @@
 use strict;
 use warnings;
 
-my ($file_name, $content_type, $var_name) = @ARGV;
-if (!$file_name || !$content_type || !$var_name) {
-  die "usage: bin2c.pl <local file name> <http content type> " .
-      "<c variable name>";
+my ($file_name) = @ARGV;
+if (!$file_name) {
+  die "usage: bin2c.pl <local file name>";
 }
 
 open(my $fh, "<", $file_name) || die "$file_name: $!";
@@ -18,12 +17,8 @@ my $data;
 }
 close($fh);
 
-my $content_len = length($data);
-
-$data = "Content-Type: $content_type\r\n" .
-        "Content-Length: $content_len\r\n" .
-        "\r\n" .
-        $data;
+my $var_name = $file_name;
+$var_name =~ s/[^A-Za-z0-9_]/_/g;
 
 my $hfile = "$var_name.h";
 open($fh, ">", $hfile) || die "$hfile: $!";

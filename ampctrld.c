@@ -29,6 +29,8 @@
 
 #define DEFAULT_ADDRESS  "0.0.0.0"
 #define DEFAULT_PORT     "8082"
+#define AMP_HOST         "onkyo"
+#define AMP_PORT         "60128"
 #define MAX_CONNS        FD_SETSIZE
 #define QUEUE_LEN        8
 
@@ -86,6 +88,17 @@ struct queue {
   char entries[QUEUE_LEN][10];
 };
 
+struct amplifier {
+  char *host;
+  char *port;
+  int socket;
+  int power;
+  int mute;
+  int volume;
+  char *input;
+  struct queue queue;
+};
+
 /* used by main() and quitterm_handler() */
 static int running = 1;
 /* used by main() and log_*() macros */
@@ -105,7 +118,7 @@ int write_all (int socket, void *buf, size_t len)
   return 0;
 }   
     
-static void quitterm_handler (int sig)
+void quitterm_handler (int sig)
 { 
   if (sig == SIGTERM)  
     log_info("SIGTERM received, going down...");
@@ -113,7 +126,7 @@ static void quitterm_handler (int sig)
   running = 0;
 }
 
-static void setup_signal (int sig, void (*handler)(int))
+void setup_signal (int sig, void (*handler)(int))
 {
   struct sigaction sa;
 
@@ -123,7 +136,7 @@ static void setup_signal (int sig, void (*handler)(int))
     err(1, "signal()");
 }
 
-static void setup_signals ()
+void setup_signals ()
 {
   sigset_t sigset;
 
@@ -140,9 +153,9 @@ static void setup_signals ()
   setup_signal(SIGQUIT, quitterm_handler);
 }
 
-static struct passwd *get_user (const char *username)
+const struct passwd *get_user (const char *username)
 {
-  struct passwd *pw = getpwnam(username);
+  const struct passwd *pw = getpwnam(username);
 
   if (!pw)
     errx(1, "no such user: %s", username);
@@ -150,9 +163,8 @@ static struct passwd *get_user (const char *username)
   return pw;
 }
 
-static char const *create_client_socket_inet (const char *addr,
-                                              const char *port,
-                                              int *client_socket)
+char const *create_client_socket_inet (const char *addr, const char *port,
+                                       int *client_socket)
 {
   int yes = 1, res;
   struct addrinfo hints, *result, *walk;
@@ -186,7 +198,7 @@ static char const *create_client_socket_inet (const char *addr,
   return err;
 }
 
-static int create_listen_socket_inet (const char *ip, const char *port)
+int create_listen_socket_inet (const char *ip, const char *port)
 {
   int listen_socket = -1, yes = 1, res;
   struct addrinfo hints, *result, *walk;
@@ -224,7 +236,7 @@ static int create_listen_socket_inet (const char *ip, const char *port)
   return listen_socket;
 }
 
-static void daemonize ()
+void daemonize ()
 {
   pid_t pid;
 
@@ -241,7 +253,7 @@ static void daemonize ()
     err(1, "chdir(/)");
 }
 
-static void save_pidfile (const char *pidfile)
+void save_pidfile (const char *pidfile)
 {
   int fd, len;
   char pid[16];
@@ -261,7 +273,7 @@ static void save_pidfile (const char *pidfile)
     errx(1, "cannot close %s", pidfile);
 }
 
-static void change_user (struct passwd *pw)
+void change_user (const struct passwd *pw)
 {
   if (initgroups(pw->pw_name, pw->pw_gid))
     err(1, "initgroups()");
@@ -271,8 +283,7 @@ static void change_user (struct passwd *pw)
     err(1, "setuid()");
 }
 
-static void client_address (struct sockets *sockets, int fd,
-                            union address uaddr)
+void client_address (struct sockets *sockets, int fd, union address uaddr)
 {
   char addr[INET6_ADDRSTRLEN];
   struct sockaddr_in *sin;
@@ -302,8 +313,8 @@ static void client_address (struct sockets *sockets, int fd,
   }
 }
 
-static char *parse_address (char *ip46_port, char **addr, char **port,
-                            char *default_port)
+const char *parse_address (char *ip46_port, char **addr, char **port,
+                           char *default_port)
 {
   char *closing_bracket;
 
@@ -330,6 +341,46 @@ static char *parse_address (char *ip46_port, char **addr, char **port,
   }
 
   return NULL;
+}
+
+void sockets_init (struct sockets *sockets)
+{
+  int i;
+
+  sockets->num_conns = 0;
+  for (i = 0; i < MAX_CONNS; i++)
+    sockets->conns[i].type = FREE;
+}
+
+const char *sockets_add (struct sockets *sockets, int fd, enum conntype type)
+{
+  if (fd >= MAX_CONNS)
+    return "socket descriptor too big, maximum is " STR(MAX_CONNS);
+
+  sockets->conns[fd].type = type;
+  if (fd >= sockets->num_conns)
+    sockets->num_conns = fd + 1;
+
+  return NULL;
+}
+
+void sockets_close (struct sockets *sockets, int fd)
+{
+  if (fd >= MAX_CONNS)
+    return;
+
+  if (sockets->conns[fd].type == FREE)
+    return;
+
+  close(fd);
+  sockets->conns[fd].type = FREE;
+
+  while ((fd >= 0) &&
+         (fd + 1 == sockets->num_conns) &&
+         (sockets->conns[fd].type == FREE)) {
+    fd--;
+    sockets->num_conns--;
+  }
 }
 
 void queue_init (struct queue *queue)
@@ -365,123 +416,91 @@ int queue_shift (struct queue *queue)
   return ret;
 }
 
-void sockets_init (struct sockets *sockets)
+void amplifier_init (struct amplifier *amplifier)
 {
-  int i;
-
-  sockets->num_conns = 0;
-  for (i = 0; i < MAX_CONNS; i++)
-    sockets->conns[i].type = FREE;
+  amplifier->host = AMP_HOST;
+  amplifier->port = AMP_PORT;
+  amplifier->socket = -1;
+  amplifier->power = 0;
+  amplifier->mute = 1;
+  amplifier->volume = -6;
+  amplifier->input = "ab";
 }
 
-char *sockets_add (struct sockets *sockets, int fd, enum conntype type)
+void amplifier_disconnect (struct amplifier *amplifier)
 {
-  if (fd >= MAX_CONNS)
-    return "socket descriptor too big, maximum is " STR(MAX_CONNS);
+  if (amplifier->socket >= 0)
+    close(amplifier->socket);
 
-  sockets->conns[fd].type = type;
-  if (fd >= sockets->num_conns)
-    sockets->num_conns = fd + 1;
+  amplifier->socket = -1;
+}
+
+const char *amplifier_connect (struct amplifier *amplifier,
+                               struct sockets *sockets)
+{
+  const char *err;
+
+  err = create_client_socket_inet(amplifier->host, amplifier->port,
+                                  &amplifier->socket);
+  if (err)
+    return err;
+
+  err = sockets_add(sockets, amplifier->socket, AMP);
+  if (err) {
+    amplifier_disconnect(amplifier);
+    return err;
+  }
+
+  queue_init(&amplifier->queue);
 
   return NULL;
 }
 
-void sockets_close (struct sockets *sockets, int fd)
+int send_http (struct sockets *sockets, int fd, const char *url, int code,
+               int connection_close, char *content_type, void *content,
+               size_t content_len)
 {
-  if (fd >= MAX_CONNS)
-    return;
-
-  if (sockets->conns[fd].type == FREE)
-    return;
-
-  close(fd);
-  sockets->conns[fd].type = FREE;
-
-  while ((fd >= 0) &&
-         (fd + 1 == sockets->num_conns) &&
-         (sockets->conns[fd].type == FREE)) {
-    fd--;
-    sockets->num_conns--;
-  }
-}
-
-static char *str2buf (char *buf, const char * const str, size_t l)
-{          
-  memcpy(buf, str, l - 1);
-  return buf + l - 1;
-}
-
-static void int2str (char *buf, int i, int len)
-{
-  char *p = buf, *start = buf - len;
-
-  while (p > start) {
-    *p-- = '0' + i % 10;
-    i /= 10;
-    if (i == 0)
-      break;
-  }
-  while (p > start)
-    *p-- = ' ';
-}
-
-static int send_http (struct sockets *sockets, int fd, const char *url,
-                      int code, int connection_close,
-                      char *header_and_content, size_t header_content_size)
-{
-  const char status_line[] = "HTTP/1.1 200 ";
-  char server_line[] = "\r\nServer: ampctrld/version " AMPCTRLD_VERSION
-                       "\r\n";
-  char connection_line[] = "Connection: close\r\n";
-  char buf[16], *p;
-  int res, idx;
-  struct iovec iov[5];
-  ssize_t len;
+  char header[512], *reason;
+  int hdr_len, len, res;
+  struct iovec iov[2];
 
   log_info("%s \"%s\" %i", sockets->conns[fd].clientname, url, code);
 
-  p = str2buf(buf, status_line, sizeof(status_line));
-  int2str(p - 2, code, 3);
-  iov[0].iov_base = buf;
-  iov[0].iov_len = sizeof(status_line) - 1;
-  len = sizeof(status_line) - 1;
-
   switch (code) {
     case 200:
-      iov[1].iov_base = "OK";
+      reason = "OK";
       break;
     case 400:
-      iov[1].iov_base = "Bad Request";
+      reason = "Bad Request";
       break;
     case 404:
-      iov[1].iov_base = "Not Found";
+      reason = "Not Found";
       break;
     default:
-      iov[1].iov_base = "Internal Server Error";
+      reason = "Internal Server Error";
+      code = 500;
       break;
   }
 
-  iov[1].iov_len = strlen(iov[1].iov_base);
-  len += strlen(iov[1].iov_base);
+  snprintf(header, sizeof(header), "HTTP/1.1 %i %s\r\n"
+           "Server: ampctrld/version " AMPCTRLD_VERSION "\r\n"
+           "Content-Type: %s\r\n"
+           "Content-Length: %lu\r\n"
+           "%s"
+           "\r\n%n",
+           code, reason, content_type, content_len,
+           (connection_close ? "Connection: close\r\n" : ""),
+           &hdr_len);
 
-  iov[2].iov_base = server_line;
-  iov[2].iov_len = sizeof(server_line) - 1;
-  len += sizeof(server_line) - 1;
+  iov[0].iov_base = header;
+  iov[0].iov_len = hdr_len;
 
-  if (connection_close) {
-    iov[3].iov_base = connection_line;
-    iov[3].iov_len = sizeof(connection_line) - 1;
-    len += sizeof(connection_line) - 1;
-    idx = 4;
-  } else {
-    idx = 3;
-  }
+  iov[1].iov_base = content;
+  iov[1].iov_len = content_len;
 
-  iov[idx].iov_base = header_and_content;
-  iov[idx++].iov_len = header_content_size;
-  len += header_content_size;
+  len = hdr_len + content_len;
 
-  res = writev(fd, iov, idx);
+  res = writev(fd, iov, 2);
   if ((res < 0) || (res != len))
     return -1;
 
@@ -491,21 +510,50 @@ static int send_http (struct sockets *sockets, int fd, const char *url,
   return 0;
 }
 
-static int read_http (struct sockets *sockets, struct queue *queue, int fd)
+const char *bool2json (int b)
+{
+  return (b ? "true" : "false");
+}
+
+int send_status (struct sockets *sockets, int fd, const char *url,
+                 int connection_close, struct amplifier *amplifier)
+{
+  char status[128];
+  int cl;
+
+  snprintf(status, sizeof(status), "{"
+           "\"connected\": %s, "
+           "\"power\": %s, "
+           "\"mute\": %s, "
+           "\"volume\": %i, "
+           "\"input\": \"%s\"}\n%n",
+           bool2json(amplifier->socket >= 0),
+           bool2json(amplifier->power),
+           bool2json(amplifier->mute),
+           amplifier->volume,
+           amplifier->input,
+           &cl);
+
+  return send_http(sockets, fd, url, 200, connection_close,
+                   "application/json", status, cl);
+}
+
+int send_text (struct sockets *sockets, int fd, const char *url, int code,
+               int connection_close, void *content, size_t content_len)
+{
+  return send_http(sockets, fd, url, code, connection_close,
+                   "text/plain", content, content_len);
+}
+
+int read_http (struct sockets *sockets, struct amplifier *amplifier, int fd)
 {
   char buf[8192], *p;
   unsigned int idx = 0;
   int res, connection_close = 0;
-#include "rootpage.h"
-#include "favicon.h"
-  char not_found[] = "Content-Type: text/plain\r\n"
-                     "Content-Length: 12\r\n"
-                     "\r\n"
-                     "Not found.\r\n";
-  char bad_request[] = "Content-Type: text/plain\r\n"
-                       "Content-Length: 14\r\n"
-                       "\r\n"
-                       "Bad Request.\r\n";
+#include "rootpage_html.h"
+#include "favicon_ico.h"
+  char not_found[] = "Not found.\n";
+  char bad_request[] = "Bad Request.\n";
 
   while (idx < sizeof(buf) - 1) {
     res = read(fd, &buf[idx], sizeof(buf) - idx - 1);
@@ -523,32 +571,37 @@ static int read_http (struct sockets *sockets, struct queue *queue, int fd)
     connection_close = (strcasestr(buf, "\r\nConnection: close\r\n") != NULL);
 
     if (!strncasecmp(buf, "GET / ", strlen("GET / ")))
-      return send_http(sockets, fd, "/", 200, connection_close, rootpage,
-                       sizeof(rootpage));
+      return send_http(sockets, fd, "/", 200, connection_close,
+                       "text/html; charset=utf8", rootpage_html,
+                       sizeof(rootpage_html));
 
     if (!strncasecmp(buf, "GET /favicon.ico ", strlen("GET /favicon.ico ")))
       return send_http(sockets, fd, "/favicon.ico", 200, connection_close,
-                       favicon, sizeof(favicon));
+                       "image/x-icon", favicon_ico, sizeof(favicon_ico));
+
+    if (!strncasecmp(buf, "GET /getstatus ", strlen("GET /getstatus ")))
+      return send_status(sockets, fd, "/getstatus", connection_close, amplifier);
 
     /* TODO */
 
     p = strchr(buf, '\r');
     *p = '\0';
 
-    return send_http(sockets, fd, buf, 404, connection_close, not_found,
+    return send_text(sockets, fd, buf, 404, connection_close, not_found,
                      sizeof(not_found) - 1);
   }
 
-  return send_http(sockets, fd, "", 400, connection_close, bad_request,
+  return send_text(sockets, fd, "", 400, connection_close, bad_request,
                    sizeof(bad_request) - 1);
 }
 
-static int handle_client (struct sockets *sockets, struct queue *queue, int fd)
+int handle_client (struct sockets *sockets, struct amplifier *amplifier,
+                   int fd)
 {
   int newfd;
   union address addr;
   socklen_t addr_len;
-  char *err;
+  const char *err;
 
   if (sockets->conns[fd].type == LISTEN) {
     do {
@@ -572,16 +625,16 @@ static int handle_client (struct sockets *sockets, struct queue *queue, int fd)
   }
 //  if (sockets->conns[fd].type == AMP)
   if (sockets->conns[fd].type == CLIENT)
-    return read_http(sockets, queue, fd);
+    return read_http(sockets, amplifier, fd);
 
   return 0;
 }
 
-static int wait_for_client (struct sockets *sockets, struct queue *queue)
+int wait_for_client (struct sockets *sockets, struct amplifier *amplifier)
 {
   int i, ready, res;
   fd_set rfds;
-  struct timeval timeout;
+  struct timeval timeout, *top;
 
   FD_ZERO(&rfds);
   for (i = 0; i < sockets->num_conns; i++)
@@ -591,8 +644,8 @@ static int wait_for_client (struct sockets *sockets, struct queue *queue)
   timeout.tv_sec = 0;
   timeout.tv_usec = 500000;
 
-  ready = select(sockets->num_conns, &rfds, NULL, NULL,
-                 (queue->start != queue->end ? &timeout : NULL));
+  top = (amplifier->queue.start != amplifier->queue.end ? &timeout : NULL);
+  ready = select(sockets->num_conns, &rfds, NULL, NULL, top);
   if (ready < 0) {
     if (errno == EINTR)
       return 0;
@@ -604,7 +657,7 @@ static int wait_for_client (struct sockets *sockets, struct queue *queue)
   for (i = 0; ready && (i < sockets->num_conns); i++) {
     if (FD_ISSET(i, &rfds)) {
       ready--;
-      if ((res = handle_client(sockets, queue, i)))
+      if ((res = handle_client(sockets, amplifier, i)))
         return res;
     }
   }
@@ -612,13 +665,14 @@ static int wait_for_client (struct sockets *sockets, struct queue *queue)
   return 0;
 }
 
-static void show_help ()
+void show_help ()
 {
   puts(
 "ampctrld version " AMPCTRLD_VERSION "\n"
 "\n"
 "Usage:\n"
 "ampctrld [-d] [-l <address[:port]>] [-p <pid file>] [-u <user>]\n"
+"         [<amplifier[:port]>]\n"
 "ampctrld -h\n"
 "\n"
 "  -d                     run in foreground, and log to stdout/stderr, do "
@@ -635,6 +689,10 @@ static void show_help ()
                                                                      "given\n"
 "  -u <user>              switch to this user; no default, run as invoking "
                                                                       "user\n"
+"\n"
+"  <amplifier[:port]>     connect to this amplifier; default: " AMP_HOST ":"
+                                                                 AMP_PORT "\n"
+"\n"
 "  -h                     show this help ;-)\n"
 );
 }
@@ -644,12 +702,12 @@ int main (int argc, char **argv)
   int res, foreground = 0;
   char *address, *port, *pidfile = NULL;
   const char *err;
-  struct passwd *user = NULL;
+  const struct passwd *user = NULL;
   struct sockets sockets;
-  struct queue queue;
+  struct amplifier amplifier;
 
   sockets_init(&sockets);
-  queue_init(&queue);
+  amplifier_init(&amplifier);
 
   while ((res = getopt(argc, argv, "dhl:p:u:")) != -1) {
     switch (res) {
@@ -669,6 +727,13 @@ int main (int argc, char **argv)
       case 'u': user = get_user(optarg); break;
       default: errx(1, "Unknown option '%c'. See -h for help.", optopt);
     }
+  }
+
+  if (optind < argc) {
+    err = parse_address(argv[optind], &amplifier.host, &amplifier.port,
+                        AMP_PORT);
+    if (err)
+      errx(1, "%s: %s", argv[optind], err);
   }
 
   if (!sockets.num_conns) {
@@ -701,7 +766,7 @@ int main (int argc, char **argv)
 #endif
 
   while (running) {
-    res = wait_for_client(&sockets, &queue);
+    res = wait_for_client(&sockets, &amplifier);
     if (res < 0)
       running = 0;
   }
