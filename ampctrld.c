@@ -33,6 +33,7 @@
 #define AMP_PORT         "60128"
 #define MAX_CONNS        FD_SETSIZE
 #define QUEUE_LEN        8
+#define CMD_LEN          28
 
 #define log_error(fmt, params ...) do { \
   if (log_to_syslog) \
@@ -85,7 +86,7 @@ struct sockets {
 
 struct queue {
   int start, end;
-  char entries[QUEUE_LEN][10];
+  char entries[QUEUE_LEN][CMD_LEN];
 };
 
 struct amplifier {
@@ -446,6 +447,43 @@ int amplifier_ready_to_send (struct amplifier* const amplifier)
   return (amplifier_connected(amplifier) && amplifier->ready_to_send);
 }
 
+void amplifier_send (struct amplifier* const amplifier, const char* const cmd)
+{
+  int slot, i;
+  size_t cmdlen, cmdlen3;
+
+  cmdlen = strlen(cmd);
+  cmdlen3 = 2 + cmdlen + 1;
+  if (cmdlen + 18 >= CMD_LEN) {
+    log_warn("command too long: %s", cmd);
+    return;
+  }
+
+  slot = queue_push(&amplifier->queue);
+  amplifier->queue.entries[slot][0] = 'I';
+  amplifier->queue.entries[slot][1] = 'S';
+  amplifier->queue.entries[slot][2] = 'C';
+  amplifier->queue.entries[slot][3] = 'P';
+  amplifier->queue.entries[slot][4] = 0;
+  amplifier->queue.entries[slot][5] = 0;
+  amplifier->queue.entries[slot][6] = 0;
+  amplifier->queue.entries[slot][7] = 16;
+  for (i = 11; i >= 8; i--) {
+    amplifier->queue.entries[slot][i] = cmdlen3 % 256;
+    cmdlen3 /= 256;
+  }
+  amplifier->queue.entries[slot][12] = 1;
+  amplifier->queue.entries[slot][13] = 0;
+  amplifier->queue.entries[slot][14] = 0;
+  amplifier->queue.entries[slot][15] = 0;
+  amplifier->queue.entries[slot][16] = '!';
+  amplifier->queue.entries[slot][17] = '1';
+  for (i = cmdlen - 1; i >= 0; i--) {
+    amplifier->queue.entries[slot][18 + i] = cmd[i];
+  }
+  amplifier->queue.entries[slot][18 + cmdlen] = '\r';
+}
+
 const char *amplifier_connect (struct amplifier* const amplifier,
                                struct sockets* const sockets)
 {
@@ -454,25 +492,36 @@ const char *amplifier_connect (struct amplifier* const amplifier,
   err = create_client_socket_inet(amplifier->host, amplifier->port,
                                   &amplifier->socket);
   if (err)
-    return err;
+    goto AMPCONN_ERR0;
 
   err = sockets_add(sockets, amplifier->socket, AMP);
-  if (err) {
-    close(amplifier->socket);
-    amplifier->socket = -1;
-    return err;
-  }
+  if (err)
+    goto AMPCONN_ERR1;
 
   amplifier->ready_to_send = 0;
   amplifier->awaiting_response = 0;
   queue_flush(&amplifier->queue);
 
+  amplifier_send(amplifier, "PWRQSTN");
+  amplifier_send(amplifier, "MVLQSTN");
+  amplifier_send(amplifier, "AMTQSTN");
+  amplifier_send(amplifier, "SLIQSTN");
+
   return NULL;
+
+AMPCONN_ERR1:
+  close(amplifier->socket);
+  amplifier->socket = -1;
+
+AMPCONN_ERR0:
+  log_warn("cannot connect to %s:%s: %s",
+           amplifier->host, amplifier->port, err);
+  return err;
 }
 
 int send_http (struct sockets* const sockets, int fd, const char* const url,
                int code, int connection_close, const char* const content_type,
-               void* const content, size_t content_len)
+               const void* const content, size_t content_len)
 {
   char header[512], *reason;
   int hdr_len, len, res;
@@ -509,6 +558,7 @@ int send_http (struct sockets* const sockets, int fd, const char* const url,
   iov[0].iov_base = header;
   iov[0].iov_len = hdr_len;
 
+  /* XXX */
   iov[1].iov_base = content;
   iov[1].iov_len = content_len;
 
@@ -553,7 +603,7 @@ int send_status (struct sockets* const sockets, int fd, const char* const url,
 }
 
 int send_text (struct sockets* const sockets, int fd, const char* const url,
-               int code, int connection_close, void* const content,
+               int code, int connection_close, const void* const content,
                size_t content_len)
 {
   return send_http(sockets, fd, url, code, connection_close,
@@ -564,6 +614,7 @@ int read_http (struct sockets* const sockets,
                struct amplifier* const amplifier, int fd)
 {
   char buf[8192], *p;
+  const char *err;
   unsigned int idx = 0;
   int res, connection_close = 0;
 #include "rootpage_html.h"
@@ -599,7 +650,16 @@ int read_http (struct sockets* const sockets,
       return send_status(sockets, fd, "/getstatus", connection_close,
                          amplifier);
 
-    /* TODO */
+    if (!strncasecmp(buf, "GET /reconnect ", strlen("GET /reconnect "))) {
+      err = amplifier_connect(amplifier, sockets);
+      if (err)
+        return send_text(sockets, fd, buf, 500, connection_close, err,
+                         strlen(err));
+      else
+        return send_text(sockets, fd, buf, 200, connection_close, "ok", 2);
+    }
+
+    /* TODO: add all commands */
 
     p = strchr(buf, '\r');
     *p = '\0';
@@ -797,6 +857,7 @@ int main (int argc, char* const * const argv)
     res = wait_for_client(&sockets, &amplifier);
     if (res < 0)
       running = 0;
+    // TODO: drain queue
   }
 
   for (res = 0; res < sockets.num_conns; res++)
