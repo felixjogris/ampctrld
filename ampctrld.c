@@ -100,7 +100,7 @@ struct sockets {
 struct command {
   char cmd[CMD_LEN];
   int len;
-  int awaiting_response;
+  int rxwait;
 };
 
 struct queue {
@@ -113,8 +113,8 @@ struct amplifier {
   char *host;
   char *port;
   int socket;
-  int ready_to_send;
-  int awaiting_response;
+  int txready;
+  int rxwait;
   int power;
   int mute;
   int volume;
@@ -464,8 +464,8 @@ void amplifier_init (struct amplifier* const amplifier)
   amplifier->host = AMP_HOST;
   amplifier->port = AMP_PORT;
   amplifier->socket = -1;
-  amplifier->ready_to_send = 0;
-  amplifier->awaiting_response = 0;
+  amplifier->txready = 0;
+  amplifier->rxwait = 0;
   amplifier->power = 0;
   amplifier->mute = 0;
   amplifier->volume = 0;
@@ -539,10 +539,10 @@ void amplifier_enqueue (struct amplifier* const amplifier,
   }
   amplifier->queue.entries[slot].cmd[18 + cmdlen] = '\r';
   amplifier->queue.entries[slot].len = 18 + cmdlen + 1;
-  amplifier->queue.entries[slot].awaiting_response = ((cmdlen <= 2) ||
-                                                      (cmd[0] != 'N') ||
-                                                      (cmd[1] != 'T') ||
-                                                      (cmd[2] != 'C'));
+  amplifier->queue.entries[slot].rxwait = ((cmdlen <= 2) ||
+                                           (cmd[0] != 'N') ||
+                                           (cmd[1] != 'T') ||
+                                           (cmd[2] != 'C'));
 }
 
 const char *amplifier_connect (struct sockets* const sockets,
@@ -562,8 +562,8 @@ const char *amplifier_connect (struct sockets* const sockets,
   if (err)
     goto AMPCONN_ERR1;
 
-  amplifier->ready_to_send = 0;
-  amplifier->awaiting_response = 0;
+  amplifier->txready = 0;
+  amplifier->rxwait = 0;
   queue_flush(&amplifier->queue);
 
   amplifier_enqueue(amplifier, "PWRQSTN");
@@ -590,14 +590,13 @@ void amplifier_send (struct sockets* const sockets,
   int slot, res;
 
   if (!amplifier_connected(amplifier) ||
-      !amplifier->ready_to_send ||
-      amplifier->awaiting_response ||
+      !amplifier->txready ||
+      amplifier->rxwait ||
       queue_empty(&amplifier->queue))
     return;
 
   slot = queue_shift(&amplifier->queue);
-  amplifier->awaiting_response =
-                             amplifier->queue.entries[slot].awaiting_response;
+  amplifier->rxwait = amplifier->queue.entries[slot].rxwait;
 
   res = write_all(amplifier->socket,
                   amplifier->queue.entries[slot].cmd,
@@ -824,7 +823,7 @@ int wait_for_client (struct sockets* const sockets,
     if (sockets->conns[i].type != FREE)
       FD_SET(i, &rfds);
 
-  if (amplifier_connected(amplifier) && !amplifier->ready_to_send)
+  if (amplifier_connected(amplifier) && !amplifier->txready)
     FD_SET(amplifier->socket, &wfds);
 
   timeout.tv_sec = 0;
@@ -841,7 +840,7 @@ int wait_for_client (struct sockets* const sockets,
   }
 
   if (amplifier_connected(amplifier) && FD_ISSET(amplifier->socket, &wfds)) {
-    amplifier->ready_to_send = 1;
+    amplifier->txready = 1;
     ready--;
   }
 
