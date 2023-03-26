@@ -83,6 +83,7 @@ union address {
 };
 
 /* defines a socket */
+#define INETADDR_STRLEN (INET6_ADDRSTRLEN + 8)
 enum conntype {
   FREE,
   LISTEN,
@@ -93,7 +94,7 @@ struct sockets {
   int num_conns;
   struct {
     enum conntype type;
-    char clientname[INET6_ADDRSTRLEN + 8];
+    char clientname[INETADDR_STRLEN];
   } conns[MAX_CONNS];
 };
 
@@ -112,6 +113,7 @@ struct queue {
 struct amplifier {
   char *host;
   char *port;
+  char addr[INETADDR_STRLEN];
   int socket;
   int txready;
   int rxwait;
@@ -119,16 +121,10 @@ struct amplifier {
   int mute;
   int volume;
   char *input;
-  const char* inputs[sizeof(AMP_INPUTS)/sizeof(AMP_INPUTS[0])][2];
+  const char* inputs[sizeof(AMP_INPUTS)/sizeof(AMP_INPUTS[0])/2][2];
+  char inputs_json[1024];
+  int inputs_jlen;
   struct queue queue;
-};
-
-enum httpcode {
-  OK,
-  BAD_REQUEST,
-  NOT_FOUND,
-  INTERNAL_SERVER_ERROR,
-  BAD_GATEWAY
 };
 
 /* used by main() and quitterm_handler() */
@@ -373,13 +369,22 @@ const char *parse_address (char* const ip46_port, char** const addr,
   }
 
   if (!closing_bracket || !*closing_bracket)
-    *port  = default_port;
+    *port = default_port;
   else {
     *port = closing_bracket + 1;
     *closing_bracket = '\0';
   }
 
   return NULL;
+}
+
+void addrport (const char* const addr, const char* const port,
+               char result[INETADDR_STRLEN])
+{
+  if (strchr(addr, ':'))
+    snprintf(result, INETADDR_STRLEN, "[%s]:%s", addr, port);
+  else
+    snprintf(result, INETADDR_STRLEN, "%s:%s", addr, port);
 }
 
 void sockets_init (struct sockets* const sockets)
@@ -463,6 +468,7 @@ void amplifier_init (struct amplifier* const amplifier)
 
   amplifier->host = AMP_HOST;
   amplifier->port = AMP_PORT;
+  addrport(AMP_HOST, AMP_PORT, &amplifier->addr[0]);
   amplifier->socket = -1;
   amplifier->txready = 0;
   amplifier->rxwait = 0;
@@ -487,14 +493,31 @@ const char *amplifier_input (struct amplifier* const amplifier,
 
   *name++ = '\0';
 
-  for (i = 0; i < sizeof(AMP_INPUTS)/sizeof(AMP_INPUTS[0]); i += 2) {
-    if (!strcmp(AMP_INPUTS[i], assignment)) {
-      amplifier->inputs[i / 2][1] = name;
+  for (i=0; i<sizeof(amplifier->inputs)/sizeof(amplifier->inputs[0]); i++) {
+    if (!strcmp(amplifier->inputs[i][0], assignment)) {
+      amplifier->inputs[i][1] = name;
       return NULL;
     }
   }
 
   return "unknown input assignment";
+}
+
+void amplifier_inputs (struct amplifier* const amplifier)
+{
+  size_t i, len = 0;
+
+  for (i=0; i<sizeof(amplifier->inputs)/sizeof(amplifier->inputs[0]); i++)
+    len += snprintf(&amplifier->inputs_json[len],
+                    sizeof(amplifier->inputs_json) - len,
+                    "%c\"%s\":\"%s\"",
+                    (i ? ',' : '{'), amplifier->inputs[i][0],
+                    amplifier->inputs[i][1]);
+
+  len += snprintf(&amplifier->inputs_json[len],
+                  sizeof(amplifier->inputs_json) - len,
+                  "}\n");
+  amplifier->inputs_jlen = len;
 }
 
 int amplifier_connected (struct amplifier* const amplifier)
@@ -553,6 +576,8 @@ const char *amplifier_connect (struct sockets* const sockets,
   if (amplifier_connected(amplifier))
     return NULL;
 
+  addrport(amplifier->host, amplifier->port, amplifier->addr);
+
   err = create_client_socket_inet(amplifier->host, amplifier->port,
                                   &amplifier->socket);
   if (err)
@@ -578,8 +603,7 @@ AMPCONN_ERR1:
   amplifier->socket = -1;
 
 AMPCONN_ERR0:
-  log_warn("cannot connect to %s:%s: %s",
-           amplifier->host, amplifier->port, err);
+  log_warn("cannot connect to %s: %s", amplifier->addr, err);
 
   return err;
 }
@@ -603,58 +627,44 @@ void amplifier_send (struct sockets* const sockets,
                   amplifier->queue.entries[slot].len);
     
   if (res) {
-    log_warn("cannot send data to %s:%s: %s", amplifier->host,
-                                              amplifier->port,
-                                              strerror(errno));
+    log_warn("cannot send data to %s: %s", amplifier->addr, strerror(errno));
     sockets_close(sockets, amplifier->socket);
     amplifier->socket = -1;
   }
 }
 
-char *http_code (const enum httpcode httpcode)
+const char *http_reason (const int code)
 {
-  switch (httpcode) {
-    case OK:          return "200";
-    case BAD_REQUEST: return "400";
-    case NOT_FOUND:   return "404";
-    case BAD_GATEWAY: return "502";
-    default:          return "500";
+  switch (code) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 500: return "Internal Server Error";
+    case 502: return "Bad Gateway";
+    default:  return "<Unknown HTTP Code>";
   }
 }
 
-char *http_reason (const enum httpcode httpcode)
-{
-  switch (httpcode) {
-    case OK:          return "OK";
-    case BAD_REQUEST: return "Bad Request";
-    case NOT_FOUND:   return "Not Found";
-    case BAD_GATEWAY: return "Bad Gateway";
-    default:          return "Internal Server Error";
-  }
-}
-
-int send_http (struct sockets* const sockets, const int fd,
-               const char* const url, const enum httpcode code,
-               const int connection_close, const char* const content_type,
-               void* const content, const size_t content_len)
+void send_http (struct sockets* const sockets, const int fd,
+                const char* const url, const int code,
+                const int connection_close, const char* const content_type,
+                void* const content, const size_t content_len)
 {
   char header[512];
   int hdr_len, len, res;
   struct iovec iov[2];
 
-  log_info("%s \"%s\" %s", sockets->conns[fd].clientname, url,
-                           http_code(code));
+  log_info("%s \"%s\" %i", sockets->conns[fd].clientname, url, code);
 
-  snprintf(header, sizeof(header),
-           "HTTP/1.1 %s %s\r\n"
-           "Server: ampctrld/version " AMPCTRLD_VERSION "\r\n"
-           "Content-Type: %s\r\n"
-           "Content-Length: %lu\r\n"
-           "%s"
-           "\r\n%n",
-           http_code(code), http_reason(code), content_type, content_len,
-           (connection_close ? "Connection: close\r\n" : ""),
-           &hdr_len);
+  hdr_len = snprintf(header, sizeof(header),
+                     "HTTP/1.1 %i %s\r\n"
+                     "Server: ampctrld/version " AMPCTRLD_VERSION "\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %lu\r\n"
+                     "%s"
+                     "\r\n",
+                     code, http_reason(code), content_type, content_len,
+                     (connection_close ? "Connection: close\r\n" : ""));
 
   iov[0].iov_base = header;
   iov[0].iov_len = hdr_len;
@@ -663,13 +673,20 @@ int send_http (struct sockets* const sockets, const int fd,
   len = hdr_len + content_len;
 
   res = writev(fd, iov, 2);
-  if ((res < 0) || (res != len))
-    return -1;
-
+  if (res < 0) {
+    log_warn("cannot send data to %s: %s", sockets->conns[fd].clientname,
+             strerror(errno));
+    sockets_close(sockets, fd);
+    return;
+  }
+  if (res != len) {
+    log_warn("sent only %i of %i bytes to %s: ", res, len,
+             sockets->conns[fd].clientname);
+    sockets_close(sockets, fd);
+    return;
+  }
   if (connection_close)
     sockets_close(sockets, fd);
-
-  return 0;
 }
 
 const char *bool2json (const int b)
@@ -677,53 +694,78 @@ const char *bool2json (const int b)
   return (b ? "true" : "false");
 }
 
-int send_status (struct sockets* const sockets, const int fd,
-                 const char* const url, const int connection_close,
-                 struct amplifier* const amplifier)
+void send_text (struct sockets* const sockets, const int fd,
+                const char* const url, const int code,
+                const int connection_close, void* const content,
+                const size_t content_len)
+{
+  send_http(sockets, fd, url, code, connection_close, "text/plain",
+            content, content_len);
+}
+
+void send_status (struct sockets* const sockets, const int fd,
+                  const char* const url, const int connection_close,
+                  struct amplifier* const amplifier)
 {
   char status[128];
-  int cl;
+  int len;
 
-  snprintf(status, sizeof(status), "{"
-           "\"connected\": %s, "
-           "\"power\": %s, "
-           "\"mute\": %s, "
-           "\"volume\": %i, "
-           "\"input\": \"%s\"}\n%n",
-           bool2json(amplifier_connected(amplifier)),
-           bool2json(amplifier->power),
-           bool2json(amplifier->mute),
-           amplifier->volume,
-           amplifier->input,
-           &cl);
+  len = snprintf(status, sizeof(status), "{"
+                 "\"connected\": %s, "
+                 "\"power\": %s, "
+                 "\"mute\": %s, "
+                 "\"volume\": %i, "
+                 "\"input\": \"%s\"}\n",
+                 bool2json(amplifier_connected(amplifier)),
+                 bool2json(amplifier->power),
+                 bool2json(amplifier->mute),
+                 amplifier->volume,
+                 amplifier->input);
 
-  return send_http(sockets, fd, url, OK, connection_close,
-                   "application/json", status, cl);
+  send_http(sockets, fd, url, 200, connection_close, "application/json",
+            status, len);
 }
 
-int send_code (struct sockets* const sockets, const int fd,
-               const char* const url, const enum httpcode code,
-               const int connection_close)
+void send_reconnect (struct sockets* const sockets, const int fd,
+                     const char* const url, const int connection_close,
+                     struct amplifier* const amplifier)
 {
-  return send_http(sockets, fd, url, code, connection_close, "text/plain",
-                   http_reason(code), strlen(http_reason(code)));
+  char ok[] = "OK.\n";
+  const char *err;
+  char buf[128];
+  int len;
+
+  err = amplifier_connect(sockets, amplifier);
+  if (err) {
+    len = snprintf(buf, sizeof(buf), "%s: %s.\n", amplifier->addr, err);
+    send_text(sockets, fd, url, 502, connection_close, buf, len);
+  } else {
+    send_text(sockets, fd, url, 200, connection_close, ok, sizeof(ok));
+  }
 }
 
-int read_http (struct sockets* const sockets,
-               struct amplifier* const amplifier, const int fd)
+void read_http (struct sockets* const sockets,
+                struct amplifier* const amplifier, const int fd)
 {
   char buf[8192], *p;
-  const char *err;
   unsigned int idx = 0;
   int res, connection_close = 0;
 #include "rootpage_html.h"
 #include "favicon_ico.h"
+  char not_found[] = "Not found.\n";
+  char bad_request[] = "Bad request.\n";
 
   while (idx < sizeof(buf) - 1) {
     res = read(fd, &buf[idx], sizeof(buf) - idx - 1);
-    if (res <= 0) {
+    if (res < 0) {
+      log_warn("cannot read data from %s: %s", sockets->conns[fd].clientname,
+               strerror(errno));
       sockets_close(sockets, fd);
-      return res;
+      return;
+    }
+    if (!res) {
+      sockets_close(sockets, fd);
+      return;
     }
 
     idx += res;
@@ -734,41 +776,42 @@ int read_http (struct sockets* const sockets,
 
     connection_close = (strcasestr(buf, "\r\nConnection: close\r\n") != NULL);
 
-    /* TODO: add all commands */
-
     if (!strncasecmp(buf, "GET /getstatus ", strlen("GET /getstatus ")))
-      return send_status(sockets, fd, "/getstatus", connection_close,
-                         amplifier);
+      send_status(sockets, fd, "/getstatus", connection_close, amplifier);
 
-    if (!strncasecmp(buf, "GET /getinputs ", strlen("GET /getinputs "))) {
-      return 0;
+    else if (!strncasecmp(buf, "GET /set?", strlen("GET /set?")))
+    {/* TODO */}
+
+    else if (!strncasecmp(buf, "GET /getinputs ", strlen("GET /getinputs ")))
+      send_http(sockets, fd, "/getinputs", 200, connection_close,
+                "application/json", amplifier->inputs_json,
+                amplifier->inputs_jlen);
+
+    else if (!strncasecmp(buf, "GET /reconnect ", strlen("GET /reconnect ")))
+      send_reconnect(sockets, fd, "/reconnect", connection_close, amplifier);
+
+    else if (!strncasecmp(buf, "GET /favicon.ico ",
+                          strlen("GET /favicon.ico ")))
+      send_http(sockets, fd, "/favicon.ico", 200, connection_close,
+                "image/x-icon", favicon_ico, sizeof(favicon_ico));
+
+    else if (!strncasecmp(buf, "GET / ", strlen("GET / ")))
+      send_http(sockets, fd, "/", 200, connection_close,
+                "text/html; charset=utf8", rootpage_html,
+                sizeof(rootpage_html));
+
+    else {
+      p = strchr(buf, '\r');
+      *p = '\0';
+      send_text(sockets, fd, buf, 404, connection_close, not_found,
+                sizeof(not_found));
     }
 
-    if (!strncasecmp(buf, "GET /reconnect ", strlen("GET /reconnect "))) {
-      err = amplifier_connect(sockets, amplifier);
-      if (err)
-        return send_code(sockets, fd, "/reconnect", BAD_GATEWAY,
-                         connection_close);
-      else
-        return send_code(sockets, fd, "/reconnect", OK, connection_close);
-    }
-
-    if (!strncasecmp(buf, "GET /favicon.ico ", strlen("GET /favicon.ico ")))
-      return send_http(sockets, fd, "/favicon.ico", OK, connection_close,
-                       "image/x-icon", favicon_ico, sizeof(favicon_ico));
-
-    if (!strncasecmp(buf, "GET / ", strlen("GET / ")))
-      return send_http(sockets, fd, "/", OK, connection_close,
-                       "text/html; charset=utf8", rootpage_html,
-                       sizeof(rootpage_html));
-
-    p = strchr(buf, '\r');
-    *p = '\0';
-
-    return send_code(sockets, fd, buf, NOT_FOUND, connection_close);
+    return;
   }
 
-  return send_code(sockets, fd, "", BAD_REQUEST, connection_close);
+  send_text(sockets, fd, "", 400, connection_close, bad_request,
+            sizeof(bad_request));
 }
 
 int handle_client (struct sockets* const sockets,
@@ -779,7 +822,13 @@ int handle_client (struct sockets* const sockets,
   socklen_t addr_len;
   const char *err;
 
-  if (sockets->conns[fd].type == LISTEN) {
+  if (sockets->conns[fd].type == CLIENT)
+    read_http(sockets, amplifier, fd);
+  else if (sockets->conns[fd].type == AMP) {
+    // TODO
+    sockets_close(sockets, fd);
+  }
+  else if (sockets->conns[fd].type == LISTEN) {
     do {
       addr_len = sizeof(addr);
       newfd = accept(fd, &addr.saddr, &addr_len);
@@ -799,12 +848,6 @@ int handle_client (struct sockets* const sockets,
 
     client_address(sockets, newfd, addr);
   }
-  if (sockets->conns[fd].type == AMP) {
-    // TODO
-    sockets_close(sockets, fd);
-  }
-  if (sockets->conns[fd].type == CLIENT)
-    return read_http(sockets, amplifier, fd);
 
   return 0;
 }
@@ -961,6 +1004,7 @@ int main (int argc, char* const * const argv)
     change_user(user);
 
   setup_signals();
+  amplifier_inputs(&amplifier);
 
   if (!foreground) {
     openlog("ampctrld", LOG_NDELAY|LOG_PID, LOG_DAEMON);
