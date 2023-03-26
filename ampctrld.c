@@ -44,6 +44,25 @@ const char* AMP_INPUTS[] = { "10", "DVD",     \
                              "22", "PHONO",   \
                              "28", "NET/USB" };
 
+const char* AMP_NETUSBCMDS[] = { "play",   \
+                                 "stop",   \
+                                 "select", \
+                                 "return", \
+                                 "down",   \
+                                 "up",     \
+                                 "left",   \
+                                 "right",  \
+                                 "0",      \
+                                 "1",      \
+                                 "2",      \
+                                 "3",      \
+                                 "4",      \
+                                 "5",      \
+                                 "6",      \
+                                 "7",      \
+                                 "8",      \
+                                 "9" };
+
 #define MAX_CONNS        FD_SETSIZE
 #define QUEUE_LEN        8
 #define CMD_LEN          28
@@ -70,6 +89,8 @@ const char* AMP_INPUTS[] = { "10", "DVD",     \
   if (log_to_syslog) syslog(LOG_INFO, fmt "\n", ## params); \
   else printf(fmt "\n", ## params); \
 } while (0)
+
+#define startswith(str, needle) strncasecmp(str, needle, strlen(needle))==0
 
 /* integer to string by preprocessor */
 #define XSTR(a) #a
@@ -462,6 +483,17 @@ int queue_shift (struct queue* const queue)
   return ret;
 }
 
+int netusbcmd (const char* const ntc, const size_t ntclen)
+{
+  size_t i;
+
+  for (i = 0; i < sizeof(AMP_NETUSBCMDS)/sizeof(AMP_NETUSBCMDS[0]); i++)
+    if (!strncmp(AMP_NETUSBCMDS[i], ntc, ntclen))
+      return i;
+
+  return -1;
+}
+
 void amplifier_init (struct amplifier* const amplifier)
 {
   size_t i;
@@ -481,26 +513,34 @@ void amplifier_init (struct amplifier* const amplifier)
   queue_flush(&amplifier->queue);
 }
 
-const char *amplifier_input (struct amplifier* const amplifier,
-                             char *assignment)
+int input_slot (struct amplifier* const amplifier, const char* const input,
+                const int input_len)
 {
-  char *name;
   size_t i;
+
+  for (i=0; i<sizeof(amplifier->inputs)/sizeof(amplifier->inputs[0]); i++)
+    if (!strncmp(amplifier->inputs[i][0], input, input_len))
+      return i;
+
+  return -1;
+}
+
+const char *amplifier_input (struct amplifier* const amplifier,
+                             const char* const assignment)
+{
+  const char *name;
+  int slot;
 
   name = strchr(assignment, '=');
   if (!name)
     return "no '=' in input assignment";
 
-  *name++ = '\0';
+  slot = input_slot(amplifier, assignment, name - assignment);
+  if (slot < 0)
+    return "unknown input assignment";
 
-  for (i=0; i<sizeof(amplifier->inputs)/sizeof(amplifier->inputs[0]); i++) {
-    if (!strcmp(amplifier->inputs[i][0], assignment)) {
-      amplifier->inputs[i][1] = name;
-      return NULL;
-    }
-  }
-
-  return "unknown input assignment";
+  amplifier->inputs[slot][1] = name + 1;
+  return NULL;
 }
 
 void amplifier_inputs (struct amplifier* const amplifier)
@@ -530,6 +570,9 @@ void amplifier_enqueue (struct amplifier* const amplifier,
 {
   int slot, i;
   size_t cmdlen, cmdlen3;
+
+  if (!amplifier_connected(amplifier))
+    return;
 
   cmdlen = strlen(cmd);
   cmdlen3 = 2 + cmdlen + 1;
@@ -744,6 +787,55 @@ void send_reconnect (struct sockets* const sockets, const int fd,
   }
 }
 
+int send_set (const char* const url, struct amplifier* const amplifier)
+{
+  const char *query, *p;
+  char cmd[CMD_LEN];
+  int volume, slot, i;
+  size_t len;
+
+  query = strchr(url, '?') + 1;
+
+  if (startswith(query, "power=true ")) {
+    amplifier_enqueue(amplifier, "PWR01");
+  }
+  else if (startswith(query, "power=false ")) {
+    amplifier_enqueue(amplifier, "PWR00");
+  }
+  else if (startswith(query, "mute=true ")) {
+    amplifier_enqueue(amplifier, "ATM01");
+  }
+  else if (startswith(query, "mute=false ")) {
+    amplifier_enqueue(amplifier, "ATM00");
+  }
+  else if (startswith(query, "volume=") &&
+           ((volume = atoi(strchr(query, '=') + 1))) &&
+           (volume > -82) && (volume <= -25)) {
+    snprintf(cmd, sizeof(cmd), "MVL%02X", volume + 82);
+    amplifier_enqueue(amplifier, cmd);
+  }
+  else if (startswith(query, "input=") &&
+           ((p = strchr(query + 6, ' '))) &&
+           ((slot = input_slot(amplifier, query + 6, p - query + 6)) >= 0)) {
+    snprintf(cmd, sizeof(cmd), "SLI%s", amplifier->inputs[slot][0]);
+    amplifier_enqueue(amplifier, cmd);
+  }
+  else if (startswith(query, "ntc=") &&
+           ((p = strchr(query + 4, ' '))) &&
+           ((slot = netusbcmd(query + 4, p - query + 4)) >= 0) &&
+           ((len = snprintf(cmd, sizeof(cmd), "NTC%s",
+                            AMP_NETUSBCMDS[slot])) < sizeof(cmd))) {
+    for (i = len - 1; i >= 0; i--)
+      cmd[i] = toupper(cmd[i]);
+    amplifier_enqueue(amplifier, cmd);
+  }
+  else {
+    return 0;
+  }
+
+  return 1;
+}
+
 void read_http (struct sockets* const sockets,
                 struct amplifier* const amplifier, const int fd)
 {
@@ -752,6 +844,7 @@ void read_http (struct sockets* const sockets,
   int res, connection_close = 0;
 #include "rootpage_html.h"
 #include "favicon_ico.h"
+  char ok[] = "OK.\n";
   char not_found[] = "Not found.\n";
   char bad_request[] = "Bad request.\n";
 
@@ -776,26 +869,26 @@ void read_http (struct sockets* const sockets,
 
     connection_close = (strcasestr(buf, "\r\nConnection: close\r\n") != NULL);
 
-    if (!strncasecmp(buf, "GET /getstatus ", strlen("GET /getstatus ")))
+    if (startswith(buf, "GET /getstatus "))
       send_status(sockets, fd, "/getstatus", connection_close, amplifier);
 
-    else if (!strncasecmp(buf, "GET /set?", strlen("GET /set?")))
-    {/* TODO */}
+    else if (startswith(buf, "GET /set?") &&
+             send_set(buf, amplifier))
+      send_text(sockets, fd, buf + 4, 200, connection_close, ok, sizeof(ok));
 
-    else if (!strncasecmp(buf, "GET /getinputs ", strlen("GET /getinputs ")))
+    else if (startswith(buf, "GET /getinputs "))
       send_http(sockets, fd, "/getinputs", 200, connection_close,
                 "application/json", amplifier->inputs_json,
                 amplifier->inputs_jlen);
 
-    else if (!strncasecmp(buf, "GET /reconnect ", strlen("GET /reconnect ")))
+    else if (startswith(buf, "GET /reconnect "))
       send_reconnect(sockets, fd, "/reconnect", connection_close, amplifier);
 
-    else if (!strncasecmp(buf, "GET /favicon.ico ",
-                          strlen("GET /favicon.ico ")))
+    else if (startswith(buf, "GET /favicon.ico "))
       send_http(sockets, fd, "/favicon.ico", 200, connection_close,
                 "image/x-icon", favicon_ico, sizeof(favicon_ico));
 
-    else if (!strncasecmp(buf, "GET / ", strlen("GET / ")))
+    else if (startswith(buf, "GET / "))
       send_http(sockets, fd, "/", 200, connection_close,
                 "text/html; charset=utf8", rootpage_html,
                 sizeof(rootpage_html));
@@ -824,10 +917,12 @@ int handle_client (struct sockets* const sockets,
 
   if (sockets->conns[fd].type == CLIENT)
     read_http(sockets, amplifier, fd);
+
   else if (sockets->conns[fd].type == AMP) {
     // TODO
     sockets_close(sockets, fd);
   }
+
   else if (sockets->conns[fd].type == LISTEN) {
     do {
       addr_len = sizeof(addr);
