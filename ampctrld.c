@@ -789,7 +789,8 @@ void send_reconnect (struct sockets* const sockets, const int fd,
 
 int send_set (const char* const url, struct amplifier* const amplifier)
 {
-  const char *query, *p;
+  const char *query;
+  char *p;
   char cmd[CMD_LEN];
   int volume, slot, i;
   size_t len;
@@ -832,6 +833,9 @@ int send_set (const char* const url, struct amplifier* const amplifier)
   else {
     return 0;
   }
+
+  if ((p = strchr(query, ' ')))
+    *p = '\0';
 
   return 1;
 }
