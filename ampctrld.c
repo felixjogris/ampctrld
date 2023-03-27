@@ -120,7 +120,7 @@ struct sockets {
 };
 
 struct command {
-  char cmd[CMD_LEN];
+  unsigned char cmd[CMD_LEN];
   int len;
   int rxwait;
 };
@@ -141,7 +141,7 @@ struct amplifier {
   int power;
   int mute;
   int volume;
-  char *input;
+  int input;
   const char* inputs[sizeof(AMP_INPUTS)/sizeof(AMP_INPUTS[0])/2][2];
   char inputs_json[1024];
   int inputs_jlen;
@@ -507,10 +507,25 @@ void amplifier_init (struct amplifier* const amplifier)
   amplifier->power = 0;
   amplifier->mute = 0;
   amplifier->volume = 0;
-  amplifier->input = "";
+  amplifier->input = -1;
   for (i = 0; i < sizeof(AMP_INPUTS)/sizeof(AMP_INPUTS[0]); i++)
     amplifier->inputs[i / 2][i % 2] = AMP_INPUTS[i];
   queue_flush(&amplifier->queue);
+}
+
+int volume_in_range (const int volume)
+{
+  return ((volume > -82) && (volume <= -25));
+}
+
+int volume_to_amplifier (const int volume)
+{
+  return volume + 82;
+}
+
+int amplifier_to_volume (const int ampvol)
+{
+  return ampvol - 82;
 }
 
 int input_slot (struct amplifier* const amplifier, const char* const input,
@@ -763,7 +778,8 @@ void send_status (struct sockets* const sockets, const int fd,
                  bool2json(amplifier->power),
                  bool2json(amplifier->mute),
                  amplifier->volume,
-                 amplifier->input);
+                 (amplifier->input < 0 ? "" :
+                  amplifier->inputs[amplifier->input][0]));
 
   send_http(sockets, fd, url, 200, connection_close, "application/json",
             status, len);
@@ -810,9 +826,9 @@ int send_set (const char* const url, struct amplifier* const amplifier)
     amplifier_enqueue(amplifier, "ATM00");
   }
   else if (startswith(query, "volume=") &&
-           ((volume = atoi(strchr(query, '=') + 1))) &&
-           (volume > -82) && (volume <= -25)) {
-    snprintf(cmd, sizeof(cmd), "MVL%02X", volume + 82);
+           ((volume = strtol(strchr(query, '=') + 1, NULL, 10))) &&
+           volume_in_range(volume)) {
+    snprintf(cmd, sizeof(cmd), "MVL%02X", volume_to_amplifier(volume));
     amplifier_enqueue(amplifier, cmd);
   }
   else if (startswith(query, "input=") &&
@@ -911,42 +927,104 @@ void read_http (struct sockets* const sockets,
             sizeof(bad_request));
 }
 
-int handle_client (struct sockets* const sockets,
-                   struct amplifier* const amplifier, const int fd)
+int accept_client (struct sockets* const sockets, const int fd)
 {
   int newfd;
   union address addr;
   socklen_t addr_len;
   const char *err;
 
+  do {
+    addr_len = sizeof(addr);
+    newfd = accept(fd, &addr.saddr, &addr_len);
+  } while ((newfd < 0) && (errno == EINTR));
+
+  if (newfd < 0) {
+    log_warn("accept(): %s", strerror(errno));
+    return newfd;
+  }
+
+  err = sockets_add(sockets, newfd, CLIENT);
+  if (err) {
+    log_warn("%s", err);
+    close(newfd);
+    return 0;
+  }
+
+  client_address(sockets, newfd, addr);
+
+  return 0;
+}
+
+void read_amplifier (struct sockets* const sockets,
+                     struct amplifier* const amplifier, const int fd)
+{
+  ssize_t datalen;
+  char data[CMD_LEN];
+  long cmdlen;
+  size_t i;
+  int volume = 0;
+
+  datalen = read(fd, data, sizeof(data));
+  if (datalen < 0)
+    log_warn("cannot read data from %s: %s",
+             amplifier->addr, strerror(errno));
+  if (datalen <= 0) {
+    sockets_close(sockets, fd);
+    amplifier->socket = -1;
+    return;
+  }
+
+  if (datalen < 20) {
+    log_warn("received short packet from %s: %lu", amplifier->addr, datalen);
+    return;
+  }
+
+  cmdlen = ((data[8] * 256 + data[9]) * 256 + data[10]) * 256 + data[11] - 4;
+  if ((data[0] != 'I') || (data[1] != 'S') ||
+      (data[2] != 'C') || (data[3] != 'P') ||
+      (data[4] != 0) || (data[5] != 0)  ||
+      (data[6] != 0) || (data[7] != 16) ||
+      (data[12] != 1) || (data[13] != 0) ||
+      (data[14] != 0) || (data[15] != 0) ||
+      (data[16] != '!') || (data[17] != '1') ||
+      (data[datalen - 2] != 0x1a) || (data[datalen - 1] != '\r') ||
+      (cmdlen < 0) || (cmdlen + 20 > datalen)) {
+    log_warn("received bogus packet from %s", amplifier->addr);
+    return;
+  }
+
+  data[datalen - 2] = '\0';
+
+  if (!strcmp(&data[18], "PWR00")) amplifier->power = 0;
+  else if (!strcmp(&data[18], "PWR01")) amplifier->power = 1;
+  else if (!strcmp(&data[18], "AMT00")) amplifier->mute = 0;
+  else if (!strcmp(&data[18], "AMT01")) amplifier->mute = 1;
+  else if (!strncmp(&data[18], "MVL", 3)) {
+    volume = amplifier_to_volume(strtol(&data[21], NULL, 16));
+    if (volume_in_range(volume))
+      amplifier->volume = volume;
+  } else if (!strncmp(&data[18], "SLI", 3)) {
+    for (i=0; i<sizeof(amplifier->inputs)/sizeof(amplifier->inputs[0]); i++)
+      if (!strcmp(amplifier->inputs[i][0], &data[21]))
+        amplifier->input = i;
+  } else if (strcmp(&data[18], "NTC")) {
+    log_warn("received unknown command from %s: %s",
+             amplifier->addr, &data[18]);
+  }
+}
+
+int handle_client (struct sockets* const sockets,
+                   struct amplifier* const amplifier, const int fd)
+{
   if (sockets->conns[fd].type == CLIENT)
     read_http(sockets, amplifier, fd);
 
-  else if (sockets->conns[fd].type == AMP) {
-    // TODO
-    sockets_close(sockets, fd);
-  }
+  else if (sockets->conns[fd].type == AMP)
+    read_amplifier(sockets, amplifier, fd);
 
-  else if (sockets->conns[fd].type == LISTEN) {
-    do {
-      addr_len = sizeof(addr);
-      newfd = accept(fd, &addr.saddr, &addr_len);
-    } while ((newfd < 0) && (errno == EINTR));
-
-    if (newfd < 0) {
-      log_warn("accept(): %s", strerror(errno));
-      return newfd;
-    }
-
-    err = sockets_add(sockets, newfd, CLIENT);
-    if (err) {
-      log_warn("%s", err);
-      close(newfd);
-      return 0;
-    }
-
-    client_address(sockets, newfd, addr);
-  }
+  else if (sockets->conns[fd].type == LISTEN)
+    return accept_client(sockets, fd);
 
   return 0;
 }
