@@ -173,13 +173,6 @@ function toggleVolumeSelect () {
   }
 }
 
-function reconnect () {
-  var xmlHttp = new XMLHttpRequest();
-  xmlHttp.open("GET", "/reconnect");
-  xmlHttp.timeout = 10000;
-  xmlHttp.send();
-}
-
 function setAny (what, level) {
   var xmlHttp = new XMLHttpRequest();
   xmlHttp.open("GET", "/set?" + what + "=" + level);
@@ -207,19 +200,34 @@ function setInput () {
 function getInputs () {
   var xmlHttp = new XMLHttpRequest();
   xmlHttp.onreadystatechange = function () {
-    if ((xmlHttp.readyState == 4) && (xmlHttp.status == 200)) {
+    var inputsElem = document.getElementById("inputs");
+    if (inputsElem && (xmlHttp.readyState == 4) && (xmlHttp.status == 200)) {
+      var len = inputsElem.options.length;
+      for (len -= 1; len >= 0; len--)
+        inputsElem.options.remove(len);
+
       try {
         var inputs = JSON.parse(xmlHttp.response);
         Object.keys(inputs).forEach(function (input) {
-          if (document.getElementById("inputs")) {
-            document.getElementById("inputs").add(new Option(inputs[input], input));
-          }
+          inputsElem.add(new Option(inputs[input], input));
         });
       } catch (e) {
       }
     }
   };
   xmlHttp.open("GET", "/getinputs");
+  xmlHttp.timeout = 10000;
+  xmlHttp.send();
+}
+
+function reconnect () {
+  var xmlHttp = new XMLHttpRequest();
+  xmlHttp.onreadystatechange = function () {
+    if ((xmlHttp.readyState == 4) && (xmlHttp.status == 200)) {
+      getInputs();
+    }
+  };
+  xmlHttp.open("GET", "/reconnect");
   xmlHttp.timeout = 10000;
   xmlHttp.send();
 }
