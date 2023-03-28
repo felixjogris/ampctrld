@@ -475,20 +475,24 @@ int queue_push (struct queue* const queue)
 
 int queue_shift (struct queue* const queue)
 {
-  int ret = (queue_empty(queue) ? -1 : queue->start);
+  int ret;
 
+  if (queue_empty(queue))
+    return -1;
+
+  ret = queue->start;
   if (++queue->start >= QUEUE_LEN)
     queue->start = 0;
 
   return ret;
 }
 
-int netusbcmd (const char* const ntc, const size_t ntclen)
+int netusbcmd (const char* const ntc)
 {
   size_t i;
 
   for (i = 0; i < sizeof(AMP_NETUSBCMDS)/sizeof(AMP_NETUSBCMDS[0]); i++)
-    if (!strncmp(AMP_NETUSBCMDS[i], ntc, ntclen))
+    if (!strcmp(AMP_NETUSBCMDS[i], ntc))
       return i;
 
   return -1;
@@ -528,13 +532,12 @@ int amplifier_to_volume (const int ampvol)
   return ampvol - 82;
 }
 
-int input_slot (struct amplifier* const amplifier, const char* const input,
-                const int input_len)
+int input_slot (struct amplifier* const amplifier, const char* const input)
 {
   size_t i;
 
   for (i=0; i<sizeof(amplifier->inputs)/sizeof(amplifier->inputs[0]); i++)
-    if (!strncmp(amplifier->inputs[i][0], input, input_len))
+    if (!strcmp(amplifier->inputs[i][0], input))
       return i;
 
   return -1;
@@ -543,18 +546,19 @@ int input_slot (struct amplifier* const amplifier, const char* const input,
 const char *amplifier_input (struct amplifier* const amplifier,
                              const char* const assignment)
 {
-  const char *name;
+  char *name;
   int slot;
 
   name = strchr(assignment, '=');
   if (!name)
     return "no '=' in input assignment";
 
-  slot = input_slot(amplifier, assignment, name - assignment);
+  *name++ = '\0';
+  slot = input_slot(amplifier, assignment);
   if (slot < 0)
     return "unknown input assignment";
 
-  amplifier->inputs[slot][1] = name + 1;
+  amplifier->inputs[slot][1] = name;
   return NULL;
 }
 
@@ -673,13 +677,13 @@ void amplifier_send (struct sockets* const sockets,
 
   if (!amplifier_connected(amplifier) ||
       !amplifier->txready ||
-      amplifier->rxwait ||
-      queue_empty(&amplifier->queue))
+      amplifier->rxwait)
     return;
 
-  slot = queue_shift(&amplifier->queue);
-  amplifier->rxwait = amplifier->queue.entries[slot].rxwait;
+  if ((slot = queue_shift(&amplifier->queue)) < 0)
+    return;
 
+  amplifier->rxwait = amplifier->queue.entries[slot].rxwait;
   res = write_all(amplifier->socket,
                   amplifier->queue.entries[slot].cmd,
                   amplifier->queue.entries[slot].len);
@@ -813,46 +817,45 @@ int send_set (const char* const url, struct amplifier* const amplifier)
   size_t len;
 
   query = strchr(url, '?') + 1;
+  if ((p = strchr(query, ' ')))
+    *p = '\0';
+  else
+    return 0;
 
-  if (startswith(query, "power=true ")) {
+  if (!strcmp(query, "power=true")) {
     amplifier_enqueue(amplifier, "PWR01");
   }
-  else if (startswith(query, "power=false ")) {
+  else if (!strcmp(query, "power=false")) {
     amplifier_enqueue(amplifier, "PWR00");
   }
-  else if (startswith(query, "mute=true ")) {
-    amplifier_enqueue(amplifier, "ATM01");
+  else if (!strcmp(query, "mute=true")) {
+    amplifier_enqueue(amplifier, "AMT01");
   }
-  else if (startswith(query, "mute=false ")) {
-    amplifier_enqueue(amplifier, "ATM00");
+  else if (!strcmp(query, "mute=false")) {
+    amplifier_enqueue(amplifier, "AMT00");
   }
   else if (startswith(query, "volume=") &&
-           ((volume = strtol(strchr(query, '=') + 1, NULL, 10))) &&
+           ((volume = strtol(query + 7, NULL, 10))) &&
            volume_in_range(volume)) {
     snprintf(cmd, sizeof(cmd), "MVL%02X", volume_to_amplifier(volume));
     amplifier_enqueue(amplifier, cmd);
   }
   else if (startswith(query, "input=") &&
-           ((p = strchr(query + 6, ' '))) &&
-           ((slot = input_slot(amplifier, query + 6, p - query + 6)) >= 0)) {
+           ((slot = input_slot(amplifier, query + 6)) >= 0)) {
     snprintf(cmd, sizeof(cmd), "SLI%s", amplifier->inputs[slot][0]);
     amplifier_enqueue(amplifier, cmd);
   }
   else if (startswith(query, "ntc=") &&
-           ((p = strchr(query + 4, ' '))) &&
-           ((slot = netusbcmd(query + 4, p - query + 4)) >= 0) &&
+           ((slot = netusbcmd(query + 4)) >= 0) &&
            ((len = snprintf(cmd, sizeof(cmd), "NTC%s",
                             AMP_NETUSBCMDS[slot])) < sizeof(cmd))) {
-    for (i = len - 1; i >= 0; i--)
+    for (i = len - 1; i >= 3; i--)
       cmd[i] = toupper(cmd[i]);
     amplifier_enqueue(amplifier, cmd);
   }
   else {
     return 0;
   }
-
-  if ((p = strchr(query, ' ')))
-    *p = '\0';
 
   return 1;
 }
