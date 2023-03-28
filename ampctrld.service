@@ -1,5 +1,5 @@
 [Unit]
-Description=Graphical equalizer daemon
+Description=Control your HiFi receiver via a web interface
 Documentation=https://ogris.de/ampcontrol/
 Requires=local-fs.target
 Conflicts=shutdown.target
