@@ -683,12 +683,13 @@ void amplifier_send (struct sockets* const sockets,
   res = write_all(amplifier->socket,
                   amplifier->queue.entries[slot].cmd,
                   amplifier->queue.entries[slot].len);
-    
   if (res) {
     log_warn("cannot send data to %s: %s", amplifier->addr, strerror(errno));
     sockets_close(sockets, amplifier->socket);
     amplifier->socket = -1;
   }
+
+  amplifier->txready = 0;
 }
 
 const char *http_reason (const int code)
@@ -975,6 +976,8 @@ void read_amplifier (struct sockets* const sockets,
     return;
   }
 
+  amplifier->rxwait = 0;
+
   if (datalen < 20) {
     log_warn("received short packet from %s: %lu", amplifier->addr, datalen);
     return;
@@ -1149,7 +1152,7 @@ int main (int argc, char* const * const argv)
 
         res = create_listen_socket_inet(address, port);
         if ((err = sockets_add(&sockets, res, LISTEN)))
-          errx(1, "%s", err);
+          errx(1, "%s: %s", optarg, err);
 
         break;
       case 'p': pidfile = optarg; break;
