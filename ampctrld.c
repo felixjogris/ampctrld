@@ -1150,6 +1150,7 @@ int main (int argc, char* const * const argv)
           errx(1, "%s: %s", optarg, err);
         break;
       case 'l':
+        /* stdin, stdout, stderr = 3 open descriptors */
         if (sockets.num_conns >= MAX_LISTEN_ADDRESSES + 3)
           errx(1, "too many addresses to listen on");
 
