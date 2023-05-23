@@ -25,13 +25,14 @@
 #  include <systemd/sd-daemon.h>
 #endif
 
-#define AMPCTRLD_VERSION "1"
+#define AMPCTRLD_VERSION     "2"
 
-#define DEFAULT_ADDRESS  "0.0.0.0"
-#define DEFAULT_PORT     "8082"
+#define DEFAULT_ADDRESS      "0.0.0.0"
+#define DEFAULT_PORT         "8082"
+#define MAX_LISTEN_ADDRESSES 16
 
-#define AMP_HOST         "onkyo"
-#define AMP_PORT         "60128"
+#define AMP_HOST             "onkyo"
+#define AMP_PORT             "60128"
 const char* AMP_INPUTS[] = { "10", "DVD",     \
                              "00", "VCR/DVR", \
                              "01", "CBL/SAT", \
@@ -63,9 +64,9 @@ const char* AMP_NETUSBCMDS[] = { "play",   \
                                  "8",      \
                                  "9" };
 
-#define MAX_CONNS        FD_SETSIZE
-#define QUEUE_LEN        8
-#define CMD_LEN          28
+#define MAX_CONNS            FD_SETSIZE
+#define QUEUE_LEN            8
+#define CMD_LEN              28
 
 #define log_error(fmt, params ...) do { \
   if (log_to_syslog) \
@@ -1098,7 +1099,7 @@ void show_help ()
 "  -i <id>=<name>           assign <name> to input <id>;\n"
 "                           may be specified multiple times\n"
 "  -l <address>[:<port>]    listen on this address and port; a maximum of "
-                                                STR(MAX_CONNS) "\n"
+                                                STR(MAX_LISTEN_ADDRESSES) "\n"
 "                           addresses may be specified; port defaults to "
                                                             DEFAULT_PORT ";\n"
 "                           default: " DEFAULT_ADDRESS ":" DEFAULT_PORT "\n"
@@ -1149,6 +1150,9 @@ int main (int argc, char* const * const argv)
           errx(1, "%s: %s", optarg, err);
         break;
       case 'l':
+        if (sockets.num_conns >= MAX_LISTEN_ADDRESSES + 3)
+          errx(1, "too many addresses to listen on");
+
         err = parse_address(optarg, &address, &port, DEFAULT_PORT);
         if (err)
           errx(1, "%s: %s", optarg, err);
