@@ -17,7 +17,7 @@ You now have /usr/local/etc/rc.d/ampctrld on FreeBSD, and /lib/systemd/system/am
 ## Usage
 
 ```
-ampctrld version 1
+ampctrld version 2
 
 Usage:
 ampctrld [-d] [-i <id>=<name>] [-l <address>[:<port>]] [-p <pid file>]
@@ -29,7 +29,7 @@ ampctrld -h
                            detach from terminal, do not log to syslog
   -i <id>=<name>           assign <name> to input <id>;
                            may be specified multiple times
-  -l <address>[:<port>]    listen on this address and port; a maximum of 1024
+  -l <address>[:<port>]    listen on this address and port; a maximum of 16
                            addresses may be specified; port defaults to 8082;
                            default: 0.0.0.0:8082
   -p <pidfile>             daemonize and save pid to this file; no default, pid
